@@ -12,6 +12,8 @@ import streamlit as st
 CSV_PATH = Path(__file__).resolve().parent / "samples.csv"
 HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
+WEBSITE_TODO = "Website to be done"
+HOURS_FALLBACK = "Not specified"
 
 STATUSES = [
     "🆕 Not Visited Yet",
@@ -103,9 +105,6 @@ KNOWN_COORDS = (
     ("iso roobertinkatu 8", 60.1638, 24.9412),
     ("tehtaankatu 27", 60.1589, 24.9448),
 )
-
-WEBSITE_TODO = "Website to be done"
-HOURS_FALLBACK = "Not specified"
 
 st.set_page_config(
     page_title="Helsinki Website Leads",
@@ -231,16 +230,6 @@ def normalize_status(raw: str) -> str:
     return STATUSES[0]
 
 
-def parse_float(value: object) -> float | None:
-    text = clean_text(value).replace(",", ".")
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
 def coords_for_address(address: str) -> tuple[float, float]:
     haystack = normalize_addr(address)
     for fragment, c_lat, c_lon in KNOWN_COORDS:
@@ -346,7 +335,7 @@ def leads_from_csv(df: pd.DataFrame) -> list[dict]:
                 "extra_i": "",
                 "name": name,
                 "address": address,
-                "website": ensure_https(normalize_website(website)) or WEBSITE_TODO,
+                "website": normalize_website(website),
                 "hours": normalize_hours(hours),
                 "status": normalize_status(param_value(url_params, f"stat_{sid}")),
                 "notes": param_value(url_params, f"note_{sid}"),
@@ -371,7 +360,7 @@ def leads_from_url(params: dict) -> list[dict]:
                 "extra_i": str(extra_i),
                 "name": name,
                 "address": address,
-                "website": ensure_https(normalize_website(param_value(params, f"new_link_{extra_i}"))) or WEBSITE_TODO,
+                "website": normalize_website(param_value(params, f"new_link_{extra_i}")),
                 "hours": normalize_hours(param_value(params, f"new_hours_{extra_i}")),
                 "status": normalize_status(
                     param_value(params, f"new_status_{extra_i}") or param_value(params, f"stat_{sid}")
@@ -408,8 +397,8 @@ st.markdown(
 
 st.title("🎯 Helsinki Website Leads")
 st.markdown(
-    "CSV-Leads aus `samples.csv`. Manuelle Leads stehen in der URL "
-    "(`new_name_0`, `new_addr_0`, …). Nach dem Speichern den **vollen Browser-Link** als Lesezeichen sichern."
+    "CSV-Leads aus `samples.csv`. Manuelle Leads stehen nur in der Browser-URL "
+    "(`new_name_0`, `new_addr_0`, …). Nach dem Speichern den **vollen Link** als Lesezeichen sichern und teilen."
 )
 
 csv_df = load_samples_csv()
@@ -601,8 +590,11 @@ for lead in enriched_rows:
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
-    st.caption("Nur Name und Adresse sind Pflicht. Der Lead wird in die Browser-URL geschrieben.")
-    with st.form("manual_lead_form", clear_on_submit=True):
+    st.caption(
+        "Nur Name und Adresse sind Pflicht. Der Lead wird in die Browser-URL geschrieben — "
+        "danach den vollen Link als Lesezeichen speichern."
+    )
+    with st.form("manual_lead_entry_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)")
         add_link = st.text_input("Website / Demo-Link (optional)")
@@ -617,12 +609,14 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
                 st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
             else:
                 next_idx = next_manual_index(url_params)
+                add_link = normalize_website(add_link)
+                add_hours = normalize_hours(add_hours)
                 st.query_params.update(
                     {
                         f"new_name_{next_idx}": add_name.strip(),
                         f"new_addr_{next_idx}": add_addr.strip(),
-                        f"new_link_{next_idx}": normalize_website(add_link),
-                        f"new_hours_{next_idx}": normalize_hours(add_hours),
+                        f"new_link_{next_idx}": add_link.strip(),
+                        f"new_hours_{next_idx}": add_hours.strip(),
                     }
                 )
                 st.rerun()
