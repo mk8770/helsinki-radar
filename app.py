@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 import re
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 CSV_PATH = Path(__file__).resolve().parent / "samples.csv"
+CLOUD_DB_URL = "https://jsonblob.com/api/jsonBlob/HelsinkiWebsiteLeadsMk8770"
 HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
 WEBSITE_TODO = "Website to be done"
@@ -113,20 +117,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-url_params = st.query_params.to_dict()
-
 if "editing_sid" not in st.session_state:
     st.session_state["editing_sid"] = ""
-
-
-def param_value(params: dict, key: str) -> str:
-    value = params.get(key, "")
-    if isinstance(value, list):
-        value = value[0] if value else ""
-    text = str(value).strip() if value is not None else ""
-    if text.lower() in {"nan", "none", "null"}:
-        return ""
-    return text
+if "cloud_db_url" not in st.session_state:
+    st.session_state["cloud_db_url"] = CLOUD_DB_URL
 
 
 def clean_text(value: object) -> str:
@@ -179,6 +173,10 @@ def normalize_addr(address: str) -> str:
 
 def fold_fi(text: str) -> str:
     return text.lower().replace("ä", "a").replace("ö", "o").replace("å", "a").replace("é", "e")
+
+
+def address_key(address: str) -> str:
+    return fold_fi(normalize_addr(address))
 
 
 def first_street_number(address: str) -> int | None:
@@ -285,6 +283,129 @@ def pick_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> str | None:
     return None
 
 
+def http_json(method: str, url: str, payload: object | None = None) -> tuple[int, object, dict]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "HelsinkiWebsiteLeads/1.0")
+    if payload is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode("utf-8") or "{}"
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = {}
+            return int(resp.status), parsed, dict(resp.headers)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        return int(exc.code), parsed, dict(exc.headers)
+
+
+def cloud_endpoint() -> str:
+    return st.session_state.get("cloud_db_url") or CLOUD_DB_URL
+
+
+def fetch_cloud_leads() -> list[dict]:
+    status, payload, _headers = http_json("GET", cloud_endpoint())
+    if status == 404:
+        create_status, created, headers = http_json("POST", "https://jsonblob.com/api/jsonBlob", {"leads": []})
+        location = headers.get("Location") or headers.get("location") or ""
+        blob_id = headers.get("X-jsonblob") or headers.get("x-jsonblob") or ""
+        if location:
+            st.session_state["cloud_db_url"] = location
+        elif blob_id:
+            st.session_state["cloud_db_url"] = f"https://jsonblob.com/api/jsonBlob/{blob_id}"
+        if create_status in {200, 201} and isinstance(created, dict):
+            payload = created
+        else:
+            return []
+    elif status != 200:
+        return []
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("leads", [])
+    else:
+        rows = []
+    cleaned: list[dict] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"))
+        address = clean_text(item.get("address"))
+        if not name or not address:
+            continue
+        cleaned.append(
+            {
+                "sid": f"cloud_{address_key(address)}",
+                "extra_i": "cloud",
+                "name": name,
+                "address": address,
+                "website": normalize_website(item.get("website")),
+                "hours": normalize_hours(item.get("hours")),
+                "status": normalize_status(item.get("status", "")),
+                "notes": clean_text(item.get("notes")),
+                "district": infer_district(address),
+                "src": "cloud",
+            }
+        )
+    return cleaned
+
+
+def save_cloud_leads(leads: list[dict]) -> bool:
+    payload = {
+        "leads": [
+            {
+                "name": lead.get("name", ""),
+                "address": lead.get("address", ""),
+                "website": lead.get("website", ""),
+                "hours": lead.get("hours", ""),
+                "status": lead.get("status", STATUSES[0]),
+                "notes": lead.get("notes", ""),
+            }
+            for lead in leads
+        ]
+    }
+    status, _body, headers = http_json("PUT", cloud_endpoint(), payload)
+    if status in {200, 201}:
+        return True
+    if status == 404:
+        create_status, _created, create_headers = http_json("POST", "https://jsonblob.com/api/jsonBlob", payload)
+        location = create_headers.get("Location") or create_headers.get("location") or ""
+        blob_id = create_headers.get("X-jsonblob") or create_headers.get("x-jsonblob") or ""
+        if location:
+            st.session_state["cloud_db_url"] = location
+        elif blob_id:
+            st.session_state["cloud_db_url"] = f"https://jsonblob.com/api/jsonBlob/{blob_id}"
+        return create_status in {200, 201}
+    _ = headers
+    return False
+
+
+def upsert_cloud_lead(entry: dict) -> bool:
+    current = fetch_cloud_leads()
+    key = address_key(entry["address"])
+    replaced = False
+    next_rows: list[dict] = []
+    for lead in current:
+        if address_key(lead["address"]) == key:
+            merged = dict(lead)
+            merged.update(entry)
+            next_rows.append(merged)
+            replaced = True
+        else:
+            next_rows.append(lead)
+    if not replaced:
+        next_rows.append(entry)
+    return save_cloud_leads(next_rows)
+
+
 def load_samples_csv() -> pd.DataFrame:
     if not CSV_PATH.exists():
         st.error("Could not find samples.csv next to the app.")
@@ -300,20 +421,6 @@ def load_samples_csv() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def manual_indices(params: dict) -> list[int]:
-    found: list[int] = []
-    for key in params.keys():
-        match = re.fullmatch(r"new_name_(\d+)", str(key))
-        if match:
-            found.append(int(match.group(1)))
-    return sorted(set(found))
-
-
-def next_manual_index(params: dict) -> int:
-    ids = manual_indices(params)
-    return (max(ids) + 1) if ids else 0
-
-
 def leads_from_csv(df: pd.DataFrame) -> list[dict]:
     name_col = pick_col(df, ("company-name", "company_name", "name", "firma", "company"))
     addr_col = pick_col(df, ("street-address", "street_address", "address", "adresse", "street"))
@@ -324,21 +431,20 @@ def leads_from_csv(df: pd.DataFrame) -> list[dict]:
         st.stop()
     leads: list[dict] = []
     for idx, row in df.iterrows():
-        sid = f"c{int(idx)}"
-        name = param_value(url_params, f"en_{sid}") or clean_text(row[name_col])
-        address = param_value(url_params, f"ea_{sid}") or clean_text(row[addr_col])
-        website = param_value(url_params, f"ew_{sid}") or (clean_text(row[link_col]) if link_col else "")
+        name = clean_text(row[name_col])
+        address = clean_text(row[addr_col])
+        website = clean_text(row[link_col]) if link_col else ""
         hours = clean_text(row[hours_col]) if hours_col else ""
         leads.append(
             {
-                "sid": sid,
+                "sid": f"c{int(idx)}",
                 "extra_i": "",
                 "name": name,
                 "address": address,
                 "website": normalize_website(website),
                 "hours": normalize_hours(hours),
-                "status": normalize_status(param_value(url_params, f"stat_{sid}")),
-                "notes": param_value(url_params, f"note_{sid}"),
+                "status": STATUSES[0],
+                "notes": "",
                 "district": infer_district(address),
                 "src": "csv",
             }
@@ -346,31 +452,17 @@ def leads_from_csv(df: pd.DataFrame) -> list[dict]:
     return leads
 
 
-def leads_from_url(params: dict) -> list[dict]:
-    leads: list[dict] = []
-    for extra_i in manual_indices(params):
-        name = param_value(params, f"new_name_{extra_i}")
-        address = param_value(params, f"new_addr_{extra_i}")
-        if not name or not address:
-            continue
-        sid = f"m{extra_i}"
-        leads.append(
-            {
-                "sid": sid,
-                "extra_i": str(extra_i),
-                "name": name,
-                "address": address,
-                "website": normalize_website(param_value(params, f"new_link_{extra_i}")),
-                "hours": normalize_hours(param_value(params, f"new_hours_{extra_i}")),
-                "status": normalize_status(
-                    param_value(params, f"new_status_{extra_i}") or param_value(params, f"stat_{sid}")
-                ),
-                "notes": param_value(params, f"new_notes_{extra_i}") or param_value(params, f"note_{sid}"),
-                "district": infer_district(address),
-                "src": "url",
-            }
-        )
-    return leads
+def merge_csv_and_cloud(csv_leads: list[dict], cloud_leads: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for lead in csv_leads:
+        merged[address_key(lead["address"])] = dict(lead)
+    for lead in cloud_leads:
+        key = address_key(lead["address"])
+        base = merged.get(key, {})
+        overlay = dict(lead)
+        overlay["sid"] = base.get("sid") or overlay.get("sid")
+        merged[key] = overlay
+    return list(merged.values())
 
 
 st.markdown(
@@ -397,14 +489,14 @@ st.markdown(
 
 st.title("🎯 Helsinki Website Leads")
 st.markdown(
-    "CSV-Leads aus `samples.csv`. Manuelle Leads stehen in der Browser-URL "
-    "(`new_name_0`, `new_addr_0`, …). Nach dem Speichern den **vollen Link** als Lesezeichen sichern."
+    "CSV-Leads aus `samples.csv`. Manuelle Leads und Edits liegen in der Cloud-Datenbank "
+    "und überschreiben bei gleicher Adresse den CSV-Eintrag."
 )
 
 csv_df = load_samples_csv()
 csv_leads = leads_from_csv(csv_df)
-url_leads = leads_from_url(url_params)
-all_leads = csv_leads + url_leads
+cloud_leads = fetch_cloud_leads()
+all_leads = merge_csv_and_cloud(csv_leads, cloud_leads)
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -457,8 +549,7 @@ st.markdown("---")
 st.subheader("Active Lead Pipeline")
 st.caption(
     f"{len(enriched_rows)} lead(s) visible "
-    f"({len(csv_leads)} from samples.csv + {len(url_leads)} from URL). "
-    "Bookmark the full URL after saving a lead."
+    f"({len(csv_leads)} from samples.csv, {len(cloud_leads)} from cloud; same address = cloud wins)."
 )
 
 if not enriched_rows:
@@ -486,35 +577,34 @@ for lead in enriched_rows:
                     st.session_state[f"edit_link_{uid}"] = (
                         "" if website_is_todo(lead["website"]) else lead["website"]
                     )
+                if f"edit_hours_{uid}" not in st.session_state:
+                    st.session_state[f"edit_hours_{uid}"] = lead["hours"]
                 st.text_input("Edit Name", key=f"edit_name_{uid}")
                 st.text_input("Edit Address", key=f"edit_addr_{uid}")
                 st.text_input("Edit Website Link", key=f"edit_link_{uid}")
                 save_col, cancel_col = st.columns(2)
                 with save_col:
                     if st.button("💾 Save Changes", key=f"save_info_{uid}", type="primary", use_container_width=True):
-                        new_name = st.session_state[f"edit_name_{uid}"].strip()
-                        new_addr = st.session_state[f"edit_addr_{uid}"].strip()
+                        new_name = clean_text(st.session_state[f"edit_name_{uid}"])
+                        new_addr = clean_text(st.session_state[f"edit_addr_{uid}"])
                         new_link = normalize_website(st.session_state[f"edit_link_{uid}"])
+                        new_hours = normalize_hours(st.session_state.get(f"edit_hours_{uid}", lead["hours"]))
                         if new_name and new_addr:
-                            extra_i = lead["extra_i"]
-                            if extra_i != "":
-                                st.query_params.update(
-                                    {
-                                        f"new_name_{extra_i}": new_name,
-                                        f"new_addr_{extra_i}": new_addr,
-                                        f"new_link_{extra_i}": new_link,
-                                    }
-                                )
+                            ok = upsert_cloud_lead(
+                                {
+                                    "name": new_name,
+                                    "address": new_addr,
+                                    "website": new_link,
+                                    "hours": new_hours,
+                                    "status": st.session_state[status_key],
+                                    "notes": st.session_state[notes_key],
+                                }
+                            )
+                            if not ok:
+                                st.error("Cloud-Save fehlgeschlagen. Bitte erneut versuchen.")
                             else:
-                                st.query_params.update(
-                                    {
-                                        f"en_{uid}": new_name,
-                                        f"ea_{uid}": new_addr,
-                                        f"ew_{uid}": new_link,
-                                    }
-                                )
-                            st.session_state["editing_sid"] = ""
-                            st.rerun()
+                                st.session_state["editing_sid"] = ""
+                                st.rerun()
                 with cancel_col:
                     if st.button("❌ Cancel", key=f"cancel_info_{uid}", use_container_width=True):
                         st.session_state["editing_sid"] = ""
@@ -547,10 +637,16 @@ for lead in enriched_rows:
                 label_visibility="collapsed",
             )
             if chosen_status != lead["status"]:
-                payload = {f"stat_{uid}": chosen_status, f"note_{uid}": st.session_state[notes_key]}
-                if lead["extra_i"]:
-                    payload[f"new_status_{lead['extra_i']}"] = chosen_status
-                st.query_params.update(payload)
+                upsert_cloud_lead(
+                    {
+                        "name": lead["name"],
+                        "address": lead["address"],
+                        "website": lead["website"],
+                        "hours": lead["hours"],
+                        "status": chosen_status,
+                        "notes": st.session_state[notes_key],
+                    }
+                )
                 st.rerun()
 
             demo_href = live_website_url(lead["website"])
@@ -578,27 +674,26 @@ for lead in enriched_rows:
 
         st.text_area("✍️ Field Notes (e.g. Email, Mobile):", key=notes_key)
         if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="secondary"):
-            payload = {
-                f"stat_{uid}": st.session_state[status_key],
-                f"note_{uid}": st.session_state[notes_key],
-            }
-            if lead["extra_i"]:
-                payload[f"new_status_{lead['extra_i']}"] = st.session_state[status_key]
-                payload[f"new_notes_{lead['extra_i']}"] = st.session_state[notes_key]
-            st.query_params.update(payload)
+            upsert_cloud_lead(
+                {
+                    "name": lead["name"],
+                    "address": lead["address"],
+                    "website": lead["website"],
+                    "hours": lead["hours"],
+                    "status": st.session_state[status_key],
+                    "notes": st.session_state[notes_key],
+                }
+            )
             st.rerun()
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
-    st.caption(
-        "Nur Name und Adresse sind Pflicht. Der Lead wird in die Browser-URL geschrieben — "
-        "danach den vollen Link als Lesezeichen speichern."
-    )
-    with st.form("bulletproof_manual_form", clear_on_submit=False):
-        add_name = st.text_input("Name des Geschäfts / Firma:", key="form_input_name")
-        add_addr = st.text_input("Adresse (z.B. Hämeentie 38):", key="form_input_addr")
-        add_link = st.text_input("Website / Demo-Link:", value="https://", key="form_input_link")
-        add_hours = st.text_input("Visiting Hours:", value="12:00 - 20:00", key="form_input_hours")
+    st.caption("Nur Name und Adresse sind Pflicht. Der Lead wird in die Cloud-Datenbank geschrieben.")
+    with st.form("unzerstörbar_manual_form", clear_on_submit=True):
+        add_name = st.text_input("Name des Geschäfts / Firma", key="cloud_form_name")
+        add_addr = st.text_input("Adresse (z.B. Hämeentie 38)", key="cloud_form_addr")
+        add_link = st.text_input("Website / Demo-Link", value="https://", key="cloud_form_link")
+        add_hours = st.text_input("Visiting Hours", value="12:00 - 20:00", key="cloud_form_hours")
         submitted = st.form_submit_button(
             "💾 LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
@@ -606,22 +701,24 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
         )
 
     if submitted:
-        add_name = clean_text(st.session_state.get("form_input_name") or add_name)
-        add_addr = clean_text(st.session_state.get("form_input_addr") or add_addr)
-        add_link = clean_text(st.session_state.get("form_input_link") or add_link)
-        add_hours = clean_text(st.session_state.get("form_input_hours") or add_hours)
+        add_name = clean_text(st.session_state.get("cloud_form_name") or add_name)
+        add_addr = clean_text(st.session_state.get("cloud_form_addr") or add_addr)
+        add_link = normalize_website(st.session_state.get("cloud_form_link") or add_link)
+        add_hours = normalize_hours(st.session_state.get("cloud_form_hours") or add_hours)
         if not add_name or not add_addr:
             st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
         else:
-            next_idx = next_manual_index(url_params)
-            add_link = normalize_website(add_link)
-            add_hours = normalize_hours(add_hours)
-            st.query_params.update(
+            ok = upsert_cloud_lead(
                 {
-                    f"new_name_{next_idx}": add_name.strip(),
-                    f"new_addr_{next_idx}": add_addr.strip(),
-                    f"new_link_{next_idx}": add_link.strip(),
-                    f"new_hours_{next_idx}": add_hours.strip(),
+                    "name": add_name,
+                    "address": add_addr,
+                    "website": add_link,
+                    "hours": add_hours,
+                    "status": STATUSES[0],
+                    "notes": "",
                 }
             )
-            st.rerun()
+            if not ok:
+                st.error("Cloud-Save fehlgeschlagen. Bitte erneut versuchen.")
+            else:
+                st.rerun()
