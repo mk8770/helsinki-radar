@@ -13,7 +13,7 @@ CSV_PATH = Path(__file__).resolve().parent / "samples.csv"
 HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
 WEBSITE_TODO = "Website to be done"
-HOURS_FALLBACK = "Not specified"
+HOURS_FALLBACK = "12:00 - 20:00"
 
 STATUSES = [
     "🆕 Not Visited Yet",
@@ -397,8 +397,8 @@ st.markdown(
 
 st.title("🎯 Helsinki Website Leads")
 st.markdown(
-    "CSV-Leads aus `samples.csv`. Manuelle Leads stehen nur in der Browser-URL "
-    "(`new_name_0`, `new_addr_0`, …). Nach dem Speichern den **vollen Link** als Lesezeichen sichern und teilen."
+    "CSV-Leads aus `samples.csv`. Manuelle Leads stehen in der Browser-URL "
+    "(`new_name_0`, `new_addr_0`, …). Nach dem Speichern den **vollen Link** als Lesezeichen sichern."
 )
 
 csv_df = load_samples_csv()
@@ -594,29 +594,34 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
         "Nur Name und Adresse sind Pflicht. Der Lead wird in die Browser-URL geschrieben — "
         "danach den vollen Link als Lesezeichen speichern."
     )
-    with st.form("manual_lead_entry_form", clear_on_submit=True):
-        add_name = st.text_input("Name des Geschäfts / Firma")
-        add_addr = st.text_input("Adresse (z.B. Hämeentie 38)")
-        add_link = st.text_input("Website / Demo-Link (optional)")
-        add_hours = st.text_input("Visiting Hours (optional)")
+    with st.form("bulletproof_manual_form", clear_on_submit=False):
+        add_name = st.text_input("Name des Geschäfts / Firma:", key="form_input_name")
+        add_addr = st.text_input("Adresse (z.B. Hämeentie 38):", key="form_input_addr")
+        add_link = st.text_input("Website / Demo-Link:", value="https://", key="form_input_link")
+        add_hours = st.text_input("Visiting Hours:", value="12:00 - 20:00", key="form_input_hours")
         submitted = st.form_submit_button(
             "💾 LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
             type="primary",
         )
-        if submitted:
-            if not add_name.strip() or not add_addr.strip():
-                st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
-            else:
-                next_idx = next_manual_index(url_params)
-                add_link = normalize_website(add_link)
-                add_hours = normalize_hours(add_hours)
-                st.query_params.update(
-                    {
-                        f"new_name_{next_idx}": add_name.strip(),
-                        f"new_addr_{next_idx}": add_addr.strip(),
-                        f"new_link_{next_idx}": add_link.strip(),
-                        f"new_hours_{next_idx}": add_hours.strip(),
-                    }
-                )
-                st.rerun()
+
+    if submitted:
+        add_name = clean_text(st.session_state.get("form_input_name") or add_name)
+        add_addr = clean_text(st.session_state.get("form_input_addr") or add_addr)
+        add_link = clean_text(st.session_state.get("form_input_link") or add_link)
+        add_hours = clean_text(st.session_state.get("form_input_hours") or add_hours)
+        if not add_name or not add_addr:
+            st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
+        else:
+            next_idx = next_manual_index(url_params)
+            add_link = normalize_website(add_link)
+            add_hours = normalize_hours(add_hours)
+            st.query_params.update(
+                {
+                    f"new_name_{next_idx}": add_name.strip(),
+                    f"new_addr_{next_idx}": add_addr.strip(),
+                    f"new_link_{next_idx}": add_link.strip(),
+                    f"new_hours_{next_idx}": add_hours.strip(),
+                }
+            )
+            st.rerun()
