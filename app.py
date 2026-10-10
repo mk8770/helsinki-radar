@@ -518,8 +518,8 @@ with filter_left:
     st.slider(
         "Max walking distance from YOUR location (meters)",
         min_value=100,
-        max_value=5000,
-        value=2000,
+        max_value=6000,
+        value=6000,
         step=50,
         disabled=home_mode,
         key="max_distance",
@@ -548,7 +548,7 @@ for lead in all_leads:
         blob = f"{packed['name']} {packed['address']} {packed['district']}".lower()
         if keyword not in blob:
             continue
-    if not home_mode and distance_m > float(st.session_state.get("max_distance", 2000)):
+    if not home_mode and distance_m > float(st.session_state.get("max_distance", 6000)):
         continue
     packed["latitude"] = lat
     packed["longitude"] = lon
