@@ -132,7 +132,7 @@ for idx, lead in enumerate(leads):
             map_src = f"https://google.com{encoded_addr}&output=embed"
             st.components.v1.iframe(map_src, height=160)
 
-st.hr()
+st.divider()
 
 # Formular zum manuellen Hinzufügen (Direkt in Google Sheets speichern)
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
