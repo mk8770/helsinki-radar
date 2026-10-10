@@ -59,8 +59,8 @@ def normalize_lead(lead):
         "website": website,
         "hours": hours,
         "district": lead.get("district") or parse_district(address),
-        "status": lead.get("status") or "Not Visited Yet",
-        "notes": lead.get("notes") or "",
+        "status": lead.get("status") or lead.get("Status") or "Not Visited Yet",
+        "notes": lead.get("notes") or lead.get("fieldNotes") or lead.get("Notes") or "",
     }
 
 
@@ -94,6 +94,7 @@ def parse_district(address_str):
     return "Central District"
 
 
+@st.cache_data(show_spinner=False)
 def load_leads_from_sheet():
     try:
         req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -172,12 +173,7 @@ def store_notes_locally(lead, current_status, current_notes):
 
 
 def put_notes_to_sheet(lead_id, current_status, current_notes):
-    payload = {
-        "sheet1": {
-            "status": current_status,
-            "notes": current_notes,
-        }
-    }
+    payload = {"sheet1": {"status": current_status, "notes": current_notes}}
     json_data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{API_URL}/{lead_id}",
@@ -187,6 +183,7 @@ def put_notes_to_sheet(lead_id, current_status, current_notes):
     )
     with urllib.request.urlopen(req, timeout=7) as response:
         response.read()
+    load_leads_from_sheet.clear()
 
 
 def merge_leads(cloud_leads, local_leads, deleted_addrs):
@@ -285,6 +282,7 @@ for idx, lead in enumerate(leads):
                         saved_ok = False
                         st.error(f"Notizen lokal gespeichert, Cloud-Update fehlgeschlagen: {exc}")
                 if saved_ok:
+                    load_leads_from_sheet.clear()
                     st.session_state["note_flash"] = True
                     st.rerun()
             if st.button(
