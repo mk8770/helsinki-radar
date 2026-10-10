@@ -102,8 +102,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-if "home_mode" not in st.session_state:
-    st.session_state["home_mode"] = True
 
 
 def clean_text(value: object) -> str:
@@ -460,7 +458,7 @@ st.caption("Google Sheets / Sheety · {} Lead(s) geladen.".format(len(all_leads)
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
 with filter_left:
-    home_mode = bool(st.session_state.get("home_mode", True))
+    home_mode = bool(st.session_state.get("home_mode_toggle", True))
     st.slider(
         "Max walking distance from YOUR location (meters)",
         min_value=100,
@@ -470,8 +468,8 @@ with filter_left:
         disabled=home_mode,
         key="max_distance",
     )
-    st.checkbox("🏠 Home Mode (Show all prepared leads)", key="home_mode")
-    home_mode = bool(st.session_state.get("home_mode", True))
+    st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_toggle")
+    home_mode = bool(st.session_state.get("home_mode_toggle", True))
 with filter_right:
     industry_keyword = st.text_input(
         "Industry Keyword Filter (e.g., Ravintola, Cafe, Barber)",
@@ -622,5 +620,4 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                     response.read()
             except Exception:
                 pass
-            st.session_state["home_mode"] = True
             st.rerun()
