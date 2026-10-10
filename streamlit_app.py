@@ -151,6 +151,44 @@ def delete_lead_from_sheet(lead_id):
         pass
 
 
+def store_notes_locally(lead, current_status, current_notes):
+    addr_k = street_key(lead)
+    saved = dict(lead)
+    saved["status"] = current_status
+    saved["notes"] = current_notes
+    rows = []
+    found = False
+    for row in st.session_state["local_leads"]:
+        if street_key(row) == addr_k:
+            merged = dict(row)
+            merged.update(saved)
+            rows.append(merged)
+            found = True
+        else:
+            rows.append(row)
+    if not found:
+        rows.append(saved)
+    st.session_state["local_leads"] = rows
+
+
+def put_notes_to_sheet(lead_id, current_status, current_notes):
+    payload = {
+        "sheet1": {
+            "status": current_status,
+            "notes": current_notes,
+        }
+    }
+    json_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{API_URL}/{lead_id}",
+        data=json_data,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=7) as response:
+        response.read()
+
+
 def merge_leads(cloud_leads, local_leads, deleted_addrs):
     merged = {}
     deleted = {clean_text(a).lower() for a in deleted_addrs}
@@ -181,6 +219,8 @@ leads = merge_leads(
 
 st.title("🎯 Helsinki Website Leads")
 st.write("Synchronisiertes Cloud-Dashboard (PC & Tablet via Google Sheets)")
+if st.session_state.pop("note_flash", None):
+    st.success("Notizen gespeichert.")
 
 home_mode = st.checkbox(
     "🏠 Home Mode (Show all prepared leads)",
@@ -221,12 +261,32 @@ for idx, lead in enumerate(leads):
                 st.button("Website to be done", key=f"disabled_{idx}", disabled=True)
             else:
                 st.link_button("Open Demo Website", l_site, type="primary")
+            status_key = f"status_{idx}"
+            notes_key = f"notes_{idx}"
+            if status_key not in st.session_state:
+                st.session_state[status_key] = lead.get("status") or "Not Visited Yet"
+            if notes_key not in st.session_state:
+                st.session_state[notes_key] = lead.get("notes") or ""
             st.selectbox(
                 "Visit Status",
                 ["Not Visited Yet", "In Progress", "Interested", "Not Interested"],
-                key=f"status_{idx}",
+                key=status_key,
             )
-            st.text_area("Field Notes", key=f"notes_{idx}", height=70)
+            st.text_area("Field Notes", key=notes_key, height=70)
+            if st.button("💾 Save Note", key=f"save_btn_{idx}"):
+                current_status = st.session_state.get(status_key, "Not Visited Yet")
+                current_notes = st.session_state.get(notes_key, "")
+                store_notes_locally(lead, current_status, current_notes)
+                saved_ok = True
+                if l_id:
+                    try:
+                        put_notes_to_sheet(l_id, current_status, current_notes)
+                    except Exception as exc:
+                        saved_ok = False
+                        st.error(f"Notizen lokal gespeichert, Cloud-Update fehlgeschlagen: {exc}")
+                if saved_ok:
+                    st.session_state["note_flash"] = True
+                    st.rerun()
             if st.button(
                 "❌ Lead aus Pipeline löschen",
                 key=f"delete_{idx}",
