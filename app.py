@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import math
 import re
@@ -17,13 +16,10 @@ WEBSITE_TODO = "Website to be done"
 HOURS_FALLBACK = "12:00 - 20:00"
 HTTP_TIMEOUT = 10
 
-# Stable Immanuel key-value slot (https://keyvalue.immanuel.co — Immanuel.co).
-# App-key is hardcoded so every device shares one database. Never call GetAppKey
-# at runtime — that would mint a new empty store on every load.
-KV_HOST = "https://keyvalue.immanuel.co"
-KV_APP_KEY = "hkradar1"
-KV_CHUNK_SIZE = 800
-KV_MAX_CHUNKS = 40
+CLOUD_URL = "https://restful-api.dev"
+CLOUD_OBJECT_ID = "ff808181a09d98f701a124c4adf433f1"
+CLOUD_SLOT = f"https://api.restful-api.dev/objects/{CLOUD_OBJECT_ID}"
+CLOUD_NAME = "helsinki-radar"
 
 STATUSES = [
     "🆕 Not Visited Yet",
@@ -127,10 +123,13 @@ if "editing_sid" not in st.session_state:
     st.session_state["editing_sid"] = ""
 
 
-def kv_request(method: str, url: str) -> tuple[int, object | None]:
-    request = urllib.request.Request(url, data=None, method=method)
-    request.add_header("Accept", "application/json, text/plain, */*")
+def cloud_request(method: str, url: str, payload: dict | None = None) -> tuple[int, object | None]:
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method=method)
+    request.add_header("Accept", "application/json")
     request.add_header("User-Agent", "HelsinkiRadar/1.0")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
     context = ssl.create_default_context()
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
@@ -140,74 +139,33 @@ def kv_request(method: str, url: str) -> tuple[int, object | None]:
         return int(exc.code), None
     except Exception:
         return 0, None
-    text = raw.decode("utf-8", "ignore") if raw else ""
-    if not text:
-        return status, ""
+    if not raw:
+        return status, None
     try:
-        return status, json.loads(text)
+        return status, json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError:
-        return status, text
+        return status, None
 
 
-def kv_get(item_key: str) -> str:
-    url = f"{KV_HOST}/api/KeyVal/GetValue/{KV_APP_KEY}/{item_key}"
-    status, data = kv_request("GET", url)
-    if status != 200 or data is None:
-        return ""
-    if isinstance(data, str):
-        return data.strip().strip('"')
-    if isinstance(data, (int, float)):
-        return str(data)
-    return ""
-
-
-def kv_put(item_key: str, value: str) -> bool:
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(value))
-    url = f"{KV_HOST}/api/KeyVal/UpdateValue/{KV_APP_KEY}/{item_key}/{safe}"
-    status, _ = kv_request("POST", url)
-    return status == 200
-
-
-def encode_payload(leads: list) -> str:
-    blob = json.dumps(leads, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=")
-
-
-def decode_payload(token: str) -> list:
-    text = re.sub(r"[^A-Za-z0-9_-]", "", token or "")
-    if not text:
+def parse_leads_document(document: object) -> list:
+    if not isinstance(document, dict):
         return []
-    padding = "=" * ((4 - len(text) % 4) % 4)
-    try:
-        raw = base64.urlsafe_b64decode(text + padding)
-        parsed = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return []
-    return parsed if isinstance(parsed, list) else []
-
-
-def initialize_empty_cloud() -> list:
-    kv_put("n", "1")
-    kv_put("c0", encode_payload([]))
-    return []
+    data = document.get("data", document)
+    rows = []
+    if isinstance(data, dict):
+        rows = data.get("leads") or []
+    elif isinstance(data, list):
+        rows = data
+    if isinstance(document.get("leads"), list):
+        rows = document["leads"]
+    return rows if isinstance(rows, list) else []
 
 
 def load_cloud_leads() -> list[dict]:
-    n_raw = kv_get("n")
-    c0 = kv_get("c0")
-    if not n_raw and not c0:
-        return initialize_empty_cloud()
-    try:
-        n_chunks = max(1, min(KV_MAX_CHUNKS, int(n_raw or "1")))
-    except ValueError:
-        n_chunks = 1
-    pieces = [c0]
-    for index in range(1, n_chunks):
-        pieces.append(kv_get(f"c{index}"))
-    token = "".join(pieces)
-    if not token:
-        return initialize_empty_cloud()
-    rows = decode_payload(token)
+    status, document = cloud_request("GET", CLOUD_SLOT)
+    if status != 200 or document is None:
+        return []
+    rows = parse_leads_document(document)
     leads: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -235,16 +193,14 @@ def save_cloud_leads(leads: list[dict]) -> str:
         for lead in leads
         if clean_text(lead.get("name")) and clean_text(lead.get("address"))
     ]
-    token = encode_payload(packed)
-    chunks = [token[i : i + KV_CHUNK_SIZE] for i in range(0, len(token) or 1, KV_CHUNK_SIZE)]
-    if not chunks:
-        chunks = [encode_payload([])]
-    if not kv_put("n", str(len(chunks))):
-        return "Cloud POST failed (chunk count)"
-    for index, chunk in enumerate(chunks):
-        if not kv_put(f"c{index}", chunk):
-            return f"Cloud POST failed (chunk {index})"
-    return ""
+    payload = {"name": CLOUD_NAME, "data": {"leads": packed}}
+    status, _ = cloud_request("PUT", CLOUD_SLOT, payload)
+    if status in {200, 201}:
+        return ""
+    status, created = cloud_request("POST", "https://api.restful-api.dev/objects", payload)
+    if status in {200, 201}:
+        return ""
+    return f"Cloud save failed ({CLOUD_URL})"
 
 
 def upsert_cloud_lead(lead: dict) -> str:
@@ -469,13 +425,12 @@ st.markdown(
 
 st.title("🎯 Helsinki Website Leads")
 st.markdown(
-    "All pipeline leads live in the shared Immanuel cloud database. "
-    "The browser address bar stays clean — open the same bookmark on any phone or tab."
+    "All leads are stored in the shared cloud database. "
+    "The browser address bar stays clean — use the same short bookmark on every device."
 )
 
 all_leads = load_cloud_leads()
-
-st.caption(f"Cloud sync OK · {len(all_leads)} lead(s) in the Immanuel key-value store.")
+st.caption(f"Cloud sync via {CLOUD_URL} · {len(all_leads)} lead(s) in the pipeline.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -672,13 +627,13 @@ for lead in enriched_rows:
                 st.rerun()
 
 st.markdown("---")
-with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
-    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt den Lead in die Cloud für alle Geräte.")
-    with st.form("clean_cloud_only_form"):
+with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
+    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in die Cloud — die URL bleibt kurz.")
+    with st.form("final_cloud_only_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma", key="form_add_name")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)", key="form_add_addr")
-        add_link = st.text_input("Website / Demo-Link", key="form_add_link")
-        add_hours = st.text_input("Visiting Hours", key="form_add_hours")
+        add_link = st.text_input("Website / Demo-Link", value="https://", key="form_add_link")
+        add_hours = st.text_input("Visiting Hours", value="12:00 - 20:00", key="form_add_hours")
         submitted = st.form_submit_button(
             "💾 LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
@@ -699,7 +654,6 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
                 website=add_link,
                 hours=add_hours,
             )
-            new_lead["district"] = infer_district(add_addr)
             save_err = upsert_cloud_lead(new_lead)
             if save_err:
                 st.error(save_err)
