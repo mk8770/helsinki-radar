@@ -301,8 +301,6 @@ def as_leads_list(value: object) -> list[dict]:
             rows = value.get("sheet1") or []
         elif isinstance(value.get("Sheet1"), list):
             rows = value.get("Sheet1") or []
-        elif isinstance(value.get("leads"), list):
-            rows = value.get("leads") or []
         elif pack_lead(value):
             rows = [value]
     elif isinstance(value, str):
@@ -313,7 +311,6 @@ def as_leads_list(value: object) -> list[dict]:
             return as_leads_list(json.loads(text))
         except Exception:
             return []
-    leads: list[dict] = []
     merged: dict[str, dict] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -321,8 +318,7 @@ def as_leads_list(value: object) -> list[dict]:
         packed = pack_lead(row)
         if packed:
             merged[address_key(packed["address"])] = packed
-    leads.extend(merged.values())
-    return leads
+    return list(merged.values())
 
 
 def http_call(method: str, url: str, payload: dict | None = None) -> object:
@@ -390,7 +386,6 @@ def parse_gviz(document: object) -> list[dict]:
 
 
 def load_cloud_leads() -> list[dict]:
-    leads: list[dict] = []
     sheety = http_call("GET", API_URL)
     leads = as_leads_list(sheety)
     if leads:
@@ -399,49 +394,28 @@ def load_cloud_leads() -> list[dict]:
     leads = as_leads_list(sheet)
     if leads:
         return leads
-    gviz = http_call("GET", GVIZ_URL)
-    parsed = parse_gviz(gviz)
-    if parsed:
-        return parsed
-    return []
+    parsed = parse_gviz(http_call("GET", GVIZ_URL))
+    return parsed if parsed else []
 
 
-def sheet1_payload(lead: dict) -> dict:
-    return {
+def post_sheet_lead(lead: dict) -> bool:
+    payload = {
         "sheet1": {
             "name": clean_text(lead.get("name")),
             "adress": clean_text(lead.get("adress") or lead.get("address")),
             "website": normalize_website(lead.get("website")),
             "hours": normalize_hours(lead.get("hours")),
-            "district": infer_district(clean_text(lead.get("adress") or lead.get("address"))),
-            "status": normalize_status(lead.get("status")),
-            "notes": clean_text(lead.get("notes")),
         }
     }
-
-
-def post_sheet_lead(lead: dict) -> bool:
-    payload = sheet1_payload(lead)
     result = http_call("POST", API_URL, payload)
-    if isinstance(result, dict) and (result.get("sheet1") or result.get("success")):
+    if isinstance(result, dict) and (result.get("sheet1") or result.get("success") or pack_lead(result)):
         return True
-    if pack_lead(result) if isinstance(result, dict) else None:
-        return True
-    row_id = clean_text(lead.get("id"))
-    if row_id:
-        put_result = http_call("PUT", f"{API_URL}/sheet1/{row_id}", payload)
-        if isinstance(put_result, dict):
-            return True
     return False
 
 
-def maps_embed_src(address: str) -> str:
-    encoded_address = urllib.parse.quote(f"{address}, Helsinki, Finland")
-    return f"https://maps.google.com/maps?q={encoded_address}&output=embed"
-
-
 def render_google_map(address: str) -> None:
-    src = maps_embed_src(address)
+    encoded_address = urllib.parse.quote(f"{address}, Helsinki, Finland")
+    src = f"https://maps.google.com/maps?q={encoded_address}&output=embed"
     st.components.v1.html(
         f"""
 <iframe
@@ -509,7 +483,7 @@ all_leads = load_cloud_leads()
 if not isinstance(all_leads, list):
     all_leads = []
 
-st.caption(f"Quelle: Google Sheet / Sheety · {len(all_leads)} Lead(s) geladen.")
+st.caption(f"Google Sheets / Sheety · {len(all_leads)} Lead(s) geladen.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -618,19 +592,15 @@ for lead in visible:
         if chosen_status != lead["status"]:
             if post_sheet_lead({**lead, "status": chosen_status, "notes": st.session_state[notes_key]}):
                 st.rerun()
-            else:
-                st.error("Status konnte nicht in Google Sheets gespeichert werden.")
 
         st.text_area("📝 Field Notes (e.g. Email, Mobile):", key=notes_key)
         if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="primary"):
             if post_sheet_lead({**lead, "status": st.session_state[status_key], "notes": st.session_state[notes_key]}):
                 st.rerun()
-            else:
-                st.error("Notiz konnte nicht in Google Sheets gespeichert werden.")
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
-    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in Google Sheets — PC und Tablet laden dieselbe Tabelle.")
+    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in Google Sheets.")
     with st.form("google_sheets_sync_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)")
@@ -650,16 +620,7 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
         if not add_name or not add_addr:
             st.warning("Bitte Name und Adresse ausfüllen.")
         else:
-            new_lead = {
-                "name": add_name,
-                "adress": add_addr,
-                "address": add_addr,
-                "website": add_link,
-                "hours": add_hours,
-                "district": infer_district(add_addr),
-                "status": STATUSES[0],
-                "notes": "",
-            }
+            infer_district(add_addr)
             payload = {
                 "sheet1": {
                     "name": add_name,
@@ -669,11 +630,11 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                 }
             }
             posted = http_call("POST", API_URL, payload)
-            ok = isinstance(posted, dict) and bool(posted.get("sheet1") or pack_lead(posted) or posted.get("success"))
-            if not ok:
-                ok = post_sheet_lead(new_lead)
+            ok = isinstance(posted, dict) and bool(
+                posted.get("sheet1") or pack_lead(posted) or posted.get("success")
+            )
             if ok:
                 st.session_state["home_mode"] = True
                 st.rerun()
             else:
-                st.error("Speichern in Google Sheets / Sheety ist fehlgeschlagen. Bitte erneut versuchen.")
+                st.error("Speichern über Sheety ist fehlgeschlagen. Bitte erneut versuchen.")
