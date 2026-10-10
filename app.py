@@ -4,6 +4,7 @@ import json
 import math
 import re
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -132,7 +133,7 @@ def is_blank_null(value: object) -> bool:
         value = value.decode("utf-8", "ignore")
     if isinstance(value, str):
         text = value.strip().strip('"').strip("'")
-        return (not text) or text.lower() in {"null", "none", "undefined", "nan", "[]", "{}"}
+        return (not text) or text.lower() in {"null", "none", "undefined", "nan"}
     return False
 
 
@@ -164,9 +165,7 @@ def as_leads_list(value: object) -> list:
             return as_leads_list(value.get("leads"))
         nested = value.get("data")
         if nested is not None and nested is not value:
-            extracted = as_leads_list(nested)
-            if extracted or is_blank_null(nested) or nested == [] or nested == {}:
-                return extracted
+            return as_leads_list(nested)
         if clean_text(value.get("name")) and clean_text(value.get("address")):
             return [value]
         return []
@@ -174,78 +173,119 @@ def as_leads_list(value: object) -> list:
 
 
 def cloud_exchange(method: str, url: str, payload: dict | None = None) -> object:
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=body, method=method)
-    request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "HelsinkiRadar/1.0")
-    if body is not None:
-        request.add_header("Content-Type", "application/json")
-    context = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as exc:
+    last_error: object = None
+    for attempt in range(3):
+        fetch_url = url
+        if method == "GET":
+            stamp = urllib.parse.quote(str(time.time()) + str(attempt), safe="")
+            fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
+        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(fetch_url, data=body, method=method)
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", "HelsinkiRadar/1.0")
+        request.add_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        request.add_header("Pragma", "no-cache")
+        if body is not None:
+            request.add_header("Content-Type", "application/json; charset=utf-8")
+        context = ssl.create_default_context()
         try:
-            raw = exc.read()
-        except Exception:
-            return None
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            try:
+                raw = exc.read()
+            except Exception:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            if int(exc.code) >= 500:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.25 * (attempt + 1))
+            continue
         if not raw:
-            return None
-    except Exception:
-        return None
-    if not raw:
-        return None
-    text = raw.decode("utf-8", "ignore").strip()
-    if is_blank_null(text):
-        return None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return None
-    if parsed is None:
-        return None
-    return parsed
-
-
-def empty_cloud_payload() -> dict:
-    return {"name": CLOUD_NAME, "data": {"leads": []}}
-
-
-def initialize_cloud_slot() -> list:
-    cloud_exchange("PUT", CLOUD_SLOT, empty_cloud_payload())
-    return []
-
-
-def load_cloud_leads() -> list:
-    document = cloud_exchange("GET", CLOUD_SLOT)
-    if document is None or is_blank_null(document):
-        return initialize_cloud_slot()
-    leads = as_leads_list(document)
-    if not leads:
-        data = document.get("data") if isinstance(document, dict) else None
-        if data is None or is_blank_null(data):
-            initialize_cloud_slot()
+            last_error = "empty-body"
+            time.sleep(0.25 * (attempt + 1))
+            continue
+        text = raw.decode("utf-8", "ignore").strip()
+        if is_blank_null(text):
             return []
-    return leads if isinstance(leads, list) else []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            last_error = "invalid-json"
+            time.sleep(0.25 * (attempt + 1))
+            continue
+        if parsed is None:
+            return []
+        return parsed
+    return last_error if last_error is not None else None
+
+
+def cloud_ok(result: object) -> bool:
+    if result is None:
+        return False
+    if isinstance(result, Exception):
+        return False
+    if isinstance(result, str) and result in {"empty-body", "invalid-json"}:
+        return False
+    return True
+
+
+def load_cloud_leads() -> tuple[list, bool]:
+    """Always read the live cloud slot. Never wipe it when GET fails."""
+    document = cloud_exchange("GET", CLOUD_SLOT)
+    if not cloud_ok(document):
+        return [], False
+    leads = as_leads_list(document)
+    return (leads if isinstance(leads, list) else []), True
+
+
+def pack_cloud_payload(leads: object) -> dict:
+    packed = []
+    for item in as_leads_list(leads):
+        packed.append(serialize_lead(item))
+    return {"name": CLOUD_NAME, "data": {"leads": packed}}
+
+
+def lead_in_list(leads: list, target: dict) -> bool:
+    want = address_key(clean_text(target.get("address")))
+    want_name = clean_text(target.get("name")).lower()
+    for item in as_leads_list(leads):
+        if address_key(clean_text(item.get("address"))) == want:
+            if not want_name or clean_text(item.get("name")).lower() == want_name:
+                return True
+            return True
+    return False
 
 
 def save_cloud_leads(leads: object) -> bool:
-    safe = as_leads_list(leads)
-    packed = []
-    for item in safe:
-        packed.append(serialize_lead(item))
-    payload = {"name": CLOUD_NAME, "data": {"leads": packed}}
-    result = cloud_exchange("PUT", CLOUD_SLOT, payload)
-    if result is None:
-        result = cloud_exchange("POST", "https://api.restful-api.dev/objects", payload)
-    return result is not None
+    payload = pack_cloud_payload(leads)
+    expected = as_leads_list(payload.get("data"))
+    for _ in range(3):
+        result = cloud_exchange("PUT", CLOUD_SLOT, payload)
+        if not cloud_ok(result):
+            time.sleep(0.2)
+            continue
+        stored, ok = load_cloud_leads()
+        if ok and len(as_leads_list(stored)) >= len(expected):
+            if not expected:
+                return True
+            if all(lead_in_list(stored, item) for item in expected):
+                return True
+        time.sleep(0.2)
+    return False
 
 
 def upsert_cloud_lead(lead: dict) -> bool:
-    current = load_cloud_leads()
-    if not isinstance(current, list):
-        current = []
+    current, ok = load_cloud_leads()
+    if not ok or not isinstance(current, list):
+        return False
     incoming = serialize_lead(lead)
+    if not incoming["name"] or not incoming["address"]:
+        return False
     key = address_key(incoming["address"])
     updated: list = []
     replaced = False
@@ -253,13 +293,24 @@ def upsert_cloud_lead(lead: dict) -> bool:
         if not isinstance(item, dict):
             continue
         if address_key(clean_text(item.get("address"))) == key:
-            updated.append(incoming)
+            incoming_full = dict(serialize_lead(item))
+            incoming_full.update(incoming)
+            updated.append(incoming_full)
             replaced = True
         else:
-            updated.append(serialize_lead(item) if item.get("name") else item)
+            updated.append(serialize_lead(item))
     if not replaced:
         updated.append(incoming)
-    return save_cloud_leads(updated)
+    if not save_cloud_leads(updated):
+        return False
+    stored, stored_ok = load_cloud_leads()
+    return stored_ok and lead_in_list(stored, incoming)
+
+
+def forget_lead_widget_state() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(("status_", "notes_", "edit_name_", "edit_addr_", "edit_link_", "edit_hours_")):
+            del st.session_state[key]
 
 
 def clean_text(value: object) -> str:
@@ -479,10 +530,13 @@ st.markdown(
     "The browser address bar stays clean — use the same short bookmark on every device."
 )
 
-all_leads = load_cloud_leads()
+all_leads, cloud_live = load_cloud_leads()
 if not isinstance(all_leads, list):
     all_leads = []
-st.caption(f"Cloud sync via {BASE_URL} · {len(all_leads)} lead(s) in the pipeline.")
+if cloud_live:
+    st.caption(f"Cloud live via {BASE_URL} · {len(all_leads)} lead(s) loaded from the server.")
+else:
+    st.error("Cloud GET failed — showing an empty pipeline. Manual save is blocked until the cloud answers.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -595,9 +649,10 @@ for lead in enriched_rows:
                             )
                             if ok:
                                 st.session_state["editing_sid"] = ""
+                                forget_lead_widget_state()
                                 st.rerun()
                             else:
-                                st.error("Cloud save failed. Please try again.")
+                                st.error("Cloud save failed. The lead was not confirmed on the server.")
                         else:
                             st.warning("Name and address are required.")
                 with cancel_col:
@@ -643,9 +698,10 @@ for lead in enriched_rows:
                     )
                 )
                 if ok:
+                    forget_lead_widget_state()
                     st.rerun()
                 else:
-                    st.error("Cloud save failed. Please try again.")
+                    st.error("Cloud save failed. The lead was not confirmed on the server.")
 
             demo_href = live_website_url(lead["website"])
             if website_is_todo(lead["website"]) or not demo_href:
@@ -683,22 +739,24 @@ for lead in enriched_rows:
                 )
             )
             if ok:
+                forget_lead_widget_state()
                 st.rerun()
             else:
-                st.error("Cloud save failed. Please try again.")
+                st.error("Cloud save failed. The note was not confirmed on the server.")
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
-    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in die Cloud — die URL bleibt kurz.")
+    st.caption("Nur Name und Adresse sind Pflicht. Speichern hat höchste Priorität und überschreibt die Cloud sofort.")
     with st.form("final_cloud_only_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma", key="form_add_name")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)", key="form_add_addr")
-        add_link = st.text_input("Website / Demo-Link", value="https://", key="form_add_link")
-        add_hours = st.text_input("Visiting Hours", value="12:00 - 20:00", key="form_add_hours")
+        add_link = st.text_input("Website / Demo-Link", key="form_add_link")
+        add_hours = st.text_input("Visiting Hours", key="form_add_hours")
         submitted = st.form_submit_button(
             "💾 LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
             type="primary",
+            disabled=not cloud_live,
         )
 
     if submitted:
@@ -718,6 +776,8 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
             new_lead["district"] = infer_district(add_addr)
             ok = upsert_cloud_lead(new_lead)
             if ok:
+                forget_lead_widget_state()
+                st.session_state["home_mode"] = True
                 st.rerun()
             else:
-                st.error("Cloud save failed. Please try again.")
+                st.error("Cloud save failed. The lead was not confirmed on the server.")
