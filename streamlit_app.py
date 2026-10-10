@@ -124,6 +124,7 @@ def parse_district(address_str):
         "ty" + chr(0xf6) + "pajankatu",
         "leonkatu",
         "hermannin rantatie",
+        "polku",
     ]):
         return "Kalasatama"
     if any(k in addr for k in [
@@ -315,11 +316,11 @@ for idx, lead in enumerate(all_leads):
                             st.success("Notiz lokal gemerkt!")
                             st.rerun()
                 with btn2:
-                    if st.button("✏️ Bearbeiten", key=f"edit_btn_{idx}"):
+                    if st.button("✏️ Edit", key=f"edit_btn_{idx}"):
                         st.session_state["edit_lead_id"] = current_edit_id
                         st.rerun()
                 with btn3:
-                    if st.button("❌ Löschen", key=f"delete_{idx}", type="secondary"):
+                    if st.button("❌ Delete", key=f"delete_{idx}", type="secondary"):
                         st.session_state["local_leads"] = [
                             x
                             for x in st.session_state["local_leads"]
