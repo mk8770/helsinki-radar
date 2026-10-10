@@ -180,7 +180,7 @@ for idx, lead in enumerate(all_leads):
         
         with col2:
             encoded_addr = urllib.parse.quote(str(lead['address']) + ", Helsinki")
-            map_src = f"https://google.com{encoded_addr}&output=embed"
+            map_src = f"https://maps.google.com/maps?q={encoded_addr}&output=embed"
             st.components.v1.iframe(map_src, height=160)
 
 st.divider()
