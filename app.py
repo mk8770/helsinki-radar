@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
@@ -11,16 +12,17 @@ import urllib.request
 
 import streamlit as st
 
+ENDPOINT_URL = "https://immanuel.co"
+GET_URL = "https://immanuel.co"
+KV_API = "https://keyvalue.immanuel.co"
+KV_APP_KEY = "hkradar1"
+KV_CHUNK = 800
+HTTP_TIMEOUT = 12
+
 HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
 WEBSITE_TODO = "Website to be done"
 HOURS_FALLBACK = "12:00 - 20:00"
-HTTP_TIMEOUT = 12
-
-BASE_URL = "https://restful-api.dev"
-DB_ID = "ff808181a09d98f701a11a66d4f61e14"
-CLOUD_SLOT = f"https://api.restful-api.dev/objects/{DB_ID}"
-CLOUD_NAME = "helsinki-radar"
 
 STATUSES = [
     "🆕 Not Visited Yet",
@@ -120,197 +122,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-if "editing_sid" not in st.session_state:
-    st.session_state["editing_sid"] = ""
-
-
-def is_blank_null(value: object) -> bool:
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    if isinstance(value, (bytes, bytearray)):
-        value = value.decode("utf-8", "ignore")
-    if isinstance(value, str):
-        text = value.strip().strip('"').strip("'")
-        return (not text) or text.lower() in {"null", "none", "undefined", "nan"}
-    return False
-
-
-def as_leads_list(value: object) -> list:
-    """Always return a real Python list. Never None. Never crash on null/empty."""
-    if value is None or is_blank_null(value):
-        return []
-    if isinstance(value, list):
-        clean: list = []
-        for item in value:
-            if isinstance(item, dict) and clean_text(item.get("name")) and clean_text(item.get("address")):
-                clean.append(item)
-        return clean
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            value = value.decode("utf-8", "ignore")
-        except Exception:
-            return []
-    if isinstance(value, str):
-        text = value.strip()
-        if is_blank_null(text):
-            return []
-        try:
-            return as_leads_list(json.loads(text))
-        except Exception:
-            return []
-    if isinstance(value, dict):
-        if "leads" in value:
-            return as_leads_list(value.get("leads"))
-        nested = value.get("data")
-        if nested is not None and nested is not value:
-            return as_leads_list(nested)
-        if clean_text(value.get("name")) and clean_text(value.get("address")):
-            return [value]
-        return []
-    return []
-
-
-def cloud_exchange(method: str, url: str, payload: dict | None = None) -> object:
-    last_error: object = None
-    for attempt in range(3):
-        fetch_url = url
-        if method == "GET":
-            stamp = urllib.parse.quote(str(time.time()) + str(attempt), safe="")
-            fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
-        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(fetch_url, data=body, method=method)
-        request.add_header("Accept", "application/json")
-        request.add_header("User-Agent", "HelsinkiRadar/1.0")
-        request.add_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        request.add_header("Pragma", "no-cache")
-        if body is not None:
-            request.add_header("Content-Type", "application/json; charset=utf-8")
-        context = ssl.create_default_context()
-        try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            try:
-                raw = exc.read()
-            except Exception:
-                time.sleep(0.25 * (attempt + 1))
-                continue
-            if int(exc.code) >= 500:
-                time.sleep(0.25 * (attempt + 1))
-                continue
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.25 * (attempt + 1))
-            continue
-        if not raw:
-            last_error = "empty-body"
-            time.sleep(0.25 * (attempt + 1))
-            continue
-        text = raw.decode("utf-8", "ignore").strip()
-        if is_blank_null(text):
-            return []
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            last_error = "invalid-json"
-            time.sleep(0.25 * (attempt + 1))
-            continue
-        if parsed is None:
-            return []
-        return parsed
-    return last_error if last_error is not None else None
-
-
-def cloud_ok(result: object) -> bool:
-    if result is None:
-        return False
-    if isinstance(result, Exception):
-        return False
-    if isinstance(result, str) and result in {"empty-body", "invalid-json"}:
-        return False
-    return True
-
-
-def load_cloud_leads() -> tuple[list, bool]:
-    """Always read the live cloud slot. Never wipe it when GET fails."""
-    document = cloud_exchange("GET", CLOUD_SLOT)
-    if not cloud_ok(document):
-        return [], False
-    leads = as_leads_list(document)
-    return (leads if isinstance(leads, list) else []), True
-
-
-def pack_cloud_payload(leads: object) -> dict:
-    packed = []
-    for item in as_leads_list(leads):
-        packed.append(serialize_lead(item))
-    return {"name": CLOUD_NAME, "data": {"leads": packed}}
-
-
-def lead_in_list(leads: list, target: dict) -> bool:
-    want = address_key(clean_text(target.get("address")))
-    want_name = clean_text(target.get("name")).lower()
-    for item in as_leads_list(leads):
-        if address_key(clean_text(item.get("address"))) == want:
-            if not want_name or clean_text(item.get("name")).lower() == want_name:
-                return True
-            return True
-    return False
-
-
-def save_cloud_leads(leads: object) -> bool:
-    payload = pack_cloud_payload(leads)
-    expected = as_leads_list(payload.get("data"))
-    for _ in range(3):
-        result = cloud_exchange("PUT", CLOUD_SLOT, payload)
-        if not cloud_ok(result):
-            time.sleep(0.2)
-            continue
-        stored, ok = load_cloud_leads()
-        if ok and len(as_leads_list(stored)) >= len(expected):
-            if not expected:
-                return True
-            if all(lead_in_list(stored, item) for item in expected):
-                return True
-        time.sleep(0.2)
-    return False
-
-
-def upsert_cloud_lead(lead: dict) -> bool:
-    current, ok = load_cloud_leads()
-    if not ok or not isinstance(current, list):
-        return False
-    incoming = serialize_lead(lead)
-    if not incoming["name"] or not incoming["address"]:
-        return False
-    key = address_key(incoming["address"])
-    updated: list = []
-    replaced = False
-    for item in current:
-        if not isinstance(item, dict):
-            continue
-        if address_key(clean_text(item.get("address"))) == key:
-            incoming_full = dict(serialize_lead(item))
-            incoming_full.update(incoming)
-            updated.append(incoming_full)
-            replaced = True
-        else:
-            updated.append(serialize_lead(item))
-    if not replaced:
-        updated.append(incoming)
-    if not save_cloud_leads(updated):
-        return False
-    stored, stored_ok = load_cloud_leads()
-    return stored_ok and lead_in_list(stored, incoming)
-
-
-def forget_lead_widget_state() -> None:
-    for key in list(st.session_state.keys()):
-        if str(key).startswith(("status_", "notes_", "edit_name_", "edit_addr_", "edit_link_", "edit_hours_")):
-            del st.session_state[key]
+if "home_mode" not in st.session_state:
+    st.session_state["home_mode"] = True
 
 
 def clean_text(value: object) -> str:
@@ -320,6 +133,15 @@ def clean_text(value: object) -> str:
     if text.lower() in {"nan", "none", "null"}:
         return ""
     return text
+
+
+def is_blank_null(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        text = value.strip().strip('"').strip("'")
+        return (not text) or text.lower() in {"null", "none", "undefined", "nan"}
+    return False
 
 
 def normalize_hours(raw: object) -> str:
@@ -338,8 +160,7 @@ def normalize_website(raw: object) -> str:
 
 
 def website_is_todo(raw: object) -> bool:
-    text = normalize_website(raw)
-    return (not text) or text == WEBSITE_TODO
+    return normalize_website(raw) == WEBSITE_TODO
 
 
 def ensure_https(raw: object) -> str:
@@ -349,10 +170,6 @@ def ensure_https(raw: object) -> str:
     if text.lower().startswith(("http://", "https://")):
         return text
     return f"https://{text.lstrip('/')}"
-
-
-def live_website_url(raw: object) -> str:
-    return ensure_https(normalize_website(raw))
 
 
 def normalize_addr(address: str) -> str:
@@ -404,7 +221,7 @@ def district_matches(row_district: str, selected: str) -> bool:
     return any(alias in low for alias in aliases)
 
 
-def normalize_status(raw: str) -> str:
+def normalize_status(raw: object) -> str:
     text = clean_text(raw)
     if text in STATUSES:
         return text
@@ -445,8 +262,200 @@ def native_geo_url(lat: float, lon: float) -> str:
     return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
 
 
+def pack_lead(raw: dict) -> dict | None:
+    name = clean_text(raw.get("name"))
+    address = clean_text(raw.get("address"))
+    if not name or not address:
+        return None
+    saved_at = 0
+    try:
+        saved_at = int(raw.get("saved_at") or 0)
+    except Exception:
+        saved_at = 0
+    return {
+        "name": name,
+        "address": address,
+        "website": normalize_website(raw.get("website")),
+        "hours": normalize_hours(raw.get("hours")),
+        "status": normalize_status(raw.get("status")),
+        "notes": clean_text(raw.get("notes")),
+        "district": infer_district(address),
+        "saved_at": saved_at,
+        "sid": f"a_{address_key(address)[:24] or 'unknown'}",
+    }
+
+
+def as_leads_list(value: object) -> list[dict]:
+    if value is None or is_blank_null(value):
+        return []
+    if isinstance(value, list):
+        leads: list[dict] = []
+        for item in value:
+            if isinstance(item, dict):
+                packed = pack_lead(item)
+                if packed:
+                    leads.append(packed)
+        return leads
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", "ignore")
+        except Exception:
+            return []
+    if isinstance(value, str):
+        text = value.strip()
+        if is_blank_null(text):
+            return []
+        try:
+            return as_leads_list(json.loads(text))
+        except Exception:
+            return []
+    if isinstance(value, dict):
+        if "leads" in value:
+            return as_leads_list(value.get("leads"))
+        if "data" in value:
+            return as_leads_list(value.get("data"))
+        packed = pack_lead(value)
+        return [packed] if packed else []
+    return []
+
+
+def http_call(method: str, url: str) -> object:
+    last_error: object = None
+    for attempt in range(3):
+        fetch_url = url
+        if method == "GET":
+            stamp = urllib.parse.quote(f"{time.time()}-{attempt}", safe="")
+            fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
+        request = urllib.request.Request(fetch_url, data=None, method=method)
+        request.add_header("Accept", "application/json, text/plain, */*")
+        request.add_header("User-Agent", "HelsinkiRadar/1.0")
+        request.add_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        context = ssl.create_default_context()
+        try:
+            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            time.sleep(0.2 * (attempt + 1))
+            continue
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.2 * (attempt + 1))
+            continue
+        if not raw:
+            return ""
+        text = raw.decode("utf-8", "ignore").strip()
+        if is_blank_null(text):
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return text
+        return [] if parsed is None else parsed
+    return last_error
+
+
+def kv_get(item: str) -> str:
+    result = http_call("GET", f"{KV_API}/api/KeyVal/GetValue/{KV_APP_KEY}/{item}")
+    if isinstance(result, str):
+        return result.strip().strip('"')
+    if isinstance(result, (int, float)):
+        return str(result)
+    return ""
+
+
+def kv_put(item: str, value: str) -> bool:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(value))
+    if not safe:
+        safe = "W10"
+    result = http_call("POST", f"{KV_API}/api/KeyVal/UpdateValue/{KV_APP_KEY}/{item}/{safe}")
+    return result is True or str(result).lower() == "true"
+
+
+def encode_payload(leads: list) -> list[str]:
+    blob = json.dumps(leads, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    token = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=") or "W10"
+    return [token[i : i + KV_CHUNK] for i in range(0, len(token), KV_CHUNK)] or ["W10"]
+
+
+def decode_payload(pieces: list[str]) -> list[dict]:
+    token = re.sub(r"[^A-Za-z0-9_-]", "", "".join(pieces))
+    if not token:
+        return []
+    padding = "=" * ((4 - len(token) % 4) % 4)
+    try:
+        parsed = json.loads(base64.urlsafe_b64decode(token + padding).decode("utf-8"))
+    except Exception:
+        return []
+    return as_leads_list(parsed)
+
+
+def initialize_empty_cloud() -> list:
+    kv_put("n", "1")
+    kv_put("c0", "W10")
+    return []
+
+
+def load_cloud_leads() -> list[dict]:
+    n_raw = kv_get("n")
+    c0 = kv_get("c0")
+    if is_blank_null(n_raw) and is_blank_null(c0):
+        return initialize_empty_cloud()
+    try:
+        n_chunks = max(1, min(40, int(n_raw or "1")))
+    except ValueError:
+        n_chunks = 1
+    pieces = [c0 if i == 0 else kv_get(f"c{i}") for i in range(n_chunks)]
+    leads = decode_payload(pieces)
+    return leads if isinstance(leads, list) else []
+
+
+def save_cloud_leads(leads: object) -> bool:
+    packed = [item for item in as_leads_list(leads)]
+    chunks = encode_payload(packed)
+    if not kv_put("n", str(len(chunks))):
+        return False
+    if not all(kv_put(f"c{index}", chunk) for index, chunk in enumerate(chunks)):
+        return False
+    stored = load_cloud_leads()
+    want = {address_key(item["address"]) for item in packed}
+    have = {address_key(item["address"]) for item in stored}
+    return want.issubset(have)
+
+
+def upsert_cloud_lead(lead: dict) -> bool:
+    current = load_cloud_leads()
+    if not isinstance(current, list):
+        current = []
+    incoming = pack_lead(lead)
+    if incoming is None:
+        return False
+    incoming["saved_at"] = int(time.time())
+    key = address_key(incoming["address"])
+    updated: list[dict] = []
+    replaced = False
+    for item in current:
+        packed = pack_lead(item)
+        if packed is None:
+            continue
+        if address_key(packed["address"]) == key:
+            packed.update(incoming)
+            updated.append(packed)
+            replaced = True
+        else:
+            updated.append(packed)
+    if not replaced:
+        updated.append(incoming)
+    return save_cloud_leads(updated)
+
+
+def maps_embed_src(address: str) -> str:
+    encoded_address = urllib.parse.quote(f"{address}, Helsinki, Finland")
+    return f"https://maps.google.com/maps?q={encoded_address}&output=embed"
+
+
 def render_google_map(address: str) -> None:
-    query = urllib.parse.quote(f"{address}, Helsinki, Finland")
+    src = maps_embed_src(address)
     st.components.v1.html(
         f"""
 <iframe
@@ -454,45 +463,11 @@ def render_google_map(address: str) -> None:
     height="140"
     frameborder="0"
     style="border:0; border-radius:8px; background-color:#ffffff;"
-    src="https://maps.google.com/maps?q={query}&t=&z=15&ie=UTF8&iwloc=&output=embed">
+    src="{src}">
 </iframe>
 """,
         height=145,
     )
-
-
-def empty_lead(
-    name: str,
-    address: str,
-    website: str = "",
-    hours: str = "",
-    status: str = "",
-    notes: str = "",
-) -> dict:
-    address_text = clean_text(address)
-    return {
-        "name": clean_text(name),
-        "address": address_text,
-        "website": normalize_website(website),
-        "hours": normalize_hours(hours),
-        "status": normalize_status(status),
-        "notes": clean_text(notes),
-        "district": infer_district(address_text),
-        "sid": f"a_{address_key(address_text)[:24] or 'unknown'}",
-    }
-
-
-def serialize_lead(lead: dict) -> dict:
-    address_text = clean_text(lead.get("address"))
-    return {
-        "name": clean_text(lead.get("name")),
-        "address": address_text,
-        "website": normalize_website(lead.get("website")),
-        "hours": normalize_hours(lead.get("hours")),
-        "status": normalize_status(lead.get("status", "")),
-        "notes": clean_text(lead.get("notes")),
-        "district": infer_district(address_text),
-    }
 
 
 st.markdown(
@@ -501,16 +476,33 @@ st.markdown(
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
-    .hours-line { text-align: left; margin: 0 0 0.35rem 0; }
-    .addr-line, .district-line { display: block; margin: 0 0 0.2rem 0; line-height: 1.35; }
+    .stApp { background: #0f172a; }
+    h1 { color: #f8fafc !important; letter-spacing: -0.03em; }
+    .addr-line, .district-line, .hours-line {
+        display: block;
+        margin: 0 0 0.35rem 0;
+        line-height: 1.4;
+        color: #e2e8f0;
+    }
+    .district-badge {
+        display: inline-block;
+        background: #1e293b;
+        color: #93c5fd;
+        border: 1px solid #334155;
+        border-radius: 999px;
+        padding: 0.15rem 0.7rem;
+        font-weight: 700;
+        font-size: 0.85rem;
+        margin: 0.15rem 0 0.35rem 0;
+    }
     .nav-link {
         display: inline-block;
         font-weight: 800;
-        color: #4285F4 !important;
+        color: #3b82f6 !important;
         text-decoration: none;
-        font-size: 0.95rem;
+        font-size: 1rem;
         text-align: left;
-        margin: 0.1rem 0 0.4rem 0;
+        margin: 0.15rem 0 0.45rem 0;
     }
     div[data-testid="stForm"] button[kind="primary"] {
         background-color: #dc2626 !important;
@@ -525,23 +517,18 @@ st.markdown(
 )
 
 st.title("🎯 Helsinki Website Leads")
-st.markdown(
-    "All leads are stored in the shared cloud database. "
-    "The browser address bar stays clean — use the same short bookmark on every device."
-)
+st.write("### 🌐 Synchronisiertes Cloud-Vertriebs-Dashboard (Echtzeit-Abgleich zwischen PC und Tablet)")
 
-all_leads, cloud_live = load_cloud_leads()
+all_leads = load_cloud_leads()
 if not isinstance(all_leads, list):
     all_leads = []
-if cloud_live:
-    st.caption(f"Cloud live via {BASE_URL} · {len(all_leads)} lead(s) loaded from the server.")
-else:
-    st.error("Cloud GET failed — showing an empty pipeline. Manual save is blocked until the cloud answers.")
+
+st.caption(f"Live-Daten von {ENDPOINT_URL} · {len(all_leads)} Lead(s) in der Cloud.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
 with filter_left:
-    home_mode = bool(st.session_state.get("home_mode", False))
+    home_mode = bool(st.session_state.get("home_mode", True))
     st.slider(
         "Max walking distance from YOUR location (meters)",
         min_value=100,
@@ -552,7 +539,7 @@ with filter_left:
         key="max_distance",
     )
     st.checkbox("🏠 Home Mode (Show all prepared leads)", key="home_mode")
-    home_mode = bool(st.session_state.get("home_mode", False))
+    home_mode = bool(st.session_state.get("home_mode", True))
 with filter_right:
     industry_keyword = st.text_input(
         "Industry Keyword Filter (e.g., Ravintola, Café, Barber)",
@@ -562,46 +549,36 @@ with filter_right:
 
 origin_lat, origin_lon = HELSINKI_CENTRAL
 keyword = (industry_keyword or "").strip().lower()
-
-enriched_rows: list[dict] = []
+visible: list[dict] = []
 for lead in all_leads:
-    if not isinstance(lead, dict):
+    packed = pack_lead(lead)
+    if packed is None:
         continue
-    display = empty_lead(
-        name=lead.get("name", ""),
-        address=lead.get("address", ""),
-        website=lead.get("website", ""),
-        hours=lead.get("hours", ""),
-        status=lead.get("status", ""),
-        notes=lead.get("notes", ""),
-    )
-    lat, lon = coords_for_address(display["address"])
+    lat, lon = coords_for_address(packed["address"])
     distance_m = haversine_m(origin_lat, origin_lon, lat, lon)
-    if not district_matches(display["district"], district_filter):
+    if not district_matches(packed["district"], district_filter):
         continue
     if keyword:
-        blob = f"{display['name']} {display['address']} {display['district']}".lower()
+        blob = f"{packed['name']} {packed['address']} {packed['district']}".lower()
         if keyword not in blob:
             continue
     if not home_mode and distance_m > float(st.session_state.get("max_distance", 2000)):
         continue
-    display["latitude"] = lat
-    display["longitude"] = lon
-    display["distance_m"] = distance_m
-    enriched_rows.append(display)
+    packed["latitude"] = lat
+    packed["longitude"] = lon
+    packed["distance_m"] = distance_m
+    visible.append(packed)
 
-enriched_rows.sort(
-    key=lambda item: (0 if item["status"] == STATUSES[0] else 1, item["distance_m"], item["name"])
-)
+visible.sort(key=lambda item: (0 if item["status"] == STATUSES[0] else 1, item["distance_m"], item["name"]))
 
 st.markdown("---")
 st.subheader("Active Lead Pipeline")
-st.caption(f"{len(enriched_rows)} lead(s) visible of {len(all_leads)} stored in the cloud.")
+st.caption(f"{len(visible)} sichtbar · {len(all_leads)} in der Cloud.")
 
-if not enriched_rows:
-    st.info("No leads match these filters. Turn on Home Mode, relax the filters, or add a lead below.")
+if not visible:
+    st.info("Keine Leads sichtbar. Home Mode aktivieren oder unten einen Lead speichern.")
 
-for lead in enriched_rows:
+for lead in visible:
     uid = lead["sid"]
     status_key = f"status_{uid}"
     notes_key = f"notes_{uid}"
@@ -611,66 +588,15 @@ for lead in enriched_rows:
         st.session_state[notes_key] = lead["notes"]
 
     with st.container(border=True):
-        c1, c2 = st.columns([1.3, 1.0])
-        with c1:
-            editing = st.session_state.get("editing_sid") == uid
-            if editing:
-                if f"edit_name_{uid}" not in st.session_state:
-                    st.session_state[f"edit_name_{uid}"] = lead["name"]
-                if f"edit_addr_{uid}" not in st.session_state:
-                    st.session_state[f"edit_addr_{uid}"] = lead["address"]
-                if f"edit_link_{uid}" not in st.session_state:
-                    st.session_state[f"edit_link_{uid}"] = (
-                        "" if website_is_todo(lead["website"]) else lead["website"]
-                    )
-                if f"edit_hours_{uid}" not in st.session_state:
-                    st.session_state[f"edit_hours_{uid}"] = lead["hours"]
-                st.text_input("Edit Name", key=f"edit_name_{uid}")
-                st.text_input("Edit Address", key=f"edit_addr_{uid}")
-                st.text_input("Edit Website Link", key=f"edit_link_{uid}")
-                st.text_input("Edit Visiting Hours", key=f"edit_hours_{uid}")
-                save_col, cancel_col = st.columns(2)
-                with save_col:
-                    if st.button("💾 Save Changes", key=f"save_info_{uid}", type="primary", use_container_width=True):
-                        new_name = clean_text(st.session_state[f"edit_name_{uid}"])
-                        new_addr = clean_text(st.session_state[f"edit_addr_{uid}"])
-                        new_link = normalize_website(st.session_state[f"edit_link_{uid}"])
-                        new_hours = normalize_hours(st.session_state[f"edit_hours_{uid}"])
-                        if new_name and new_addr:
-                            ok = upsert_cloud_lead(
-                                empty_lead(
-                                    name=new_name,
-                                    address=new_addr,
-                                    website=new_link,
-                                    hours=new_hours,
-                                    status=st.session_state[status_key],
-                                    notes=st.session_state[notes_key],
-                                )
-                            )
-                            if ok:
-                                st.session_state["editing_sid"] = ""
-                                forget_lead_widget_state()
-                                st.rerun()
-                            else:
-                                st.error("Cloud save failed. The lead was not confirmed on the server.")
-                        else:
-                            st.warning("Name and address are required.")
-                with cancel_col:
-                    if st.button("❌ Cancel", key=f"cancel_info_{uid}", use_container_width=True):
-                        st.session_state["editing_sid"] = ""
-                        st.rerun()
-            else:
-                st.markdown(f"### {lead['name']}")
-                st.markdown(
-                    f"<div class='addr-line'>📍 Address: {lead['address']}, Helsinki</div>",
-                    unsafe_allow_html=True,
-                )
-                if st.button("✏️ Edit Lead Info", key=f"edit_btn_{uid}"):
-                    st.session_state["editing_sid"] = uid
-                    st.rerun()
-
+        left, right = st.columns([1.3, 1.0])
+        with left:
+            st.markdown(f"### {lead['name']}")
             st.markdown(
-                f"<div class='district-line'>🏙️ District: {lead['district']}</div>",
+                f"<div class='addr-line'>📍 {lead['address']}, Helsinki</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<span class='district-badge'>🏙️ {lead['district']}</span>",
                 unsafe_allow_html=True,
             )
             if home_mode:
@@ -679,42 +605,7 @@ for lead in enriched_rows:
                 meters = int(round(lead["distance_m"]))
                 minutes = walking_minutes(lead["distance_m"])
                 st.markdown(f"🚶‍♂️ Distance to you: {meters} m (ca. {minutes} Min. Fußweg)")
-
-            chosen_status = st.selectbox(
-                "Visit status",
-                options=STATUSES,
-                key=status_key,
-                label_visibility="collapsed",
-            )
-            if chosen_status != lead["status"]:
-                ok = upsert_cloud_lead(
-                    empty_lead(
-                        name=lead["name"],
-                        address=lead["address"],
-                        website=lead["website"],
-                        hours=lead["hours"],
-                        status=chosen_status,
-                        notes=st.session_state[notes_key],
-                    )
-                )
-                if ok:
-                    forget_lead_widget_state()
-                    st.rerun()
-                else:
-                    st.error("Cloud save failed. The lead was not confirmed on the server.")
-
-            demo_href = live_website_url(lead["website"])
-            if website_is_todo(lead["website"]) or not demo_href:
-                st.button("⚠️ Website to be done", key=f"todo_web_{uid}", disabled=True, use_container_width=True)
-            else:
-                st.link_button(
-                    f"🌐 Click here to open Demo Website for {lead['name']}",
-                    url=demo_href,
-                    type="primary",
-                    use_container_width=True,
-                )
-
-        with c2:
+        with right:
             st.markdown(
                 f"<div class='hours-line'>⏱️ Visiting Hours: <code>{lead['hours']}</code></div>",
                 unsafe_allow_html=True,
@@ -726,37 +617,43 @@ for lead in enriched_rows:
             )
             render_google_map(lead["address"])
 
-        st.text_area("✍️ Field Notes (e.g. Email, Mobile):", key=notes_key)
-        if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="secondary"):
-            ok = upsert_cloud_lead(
-                empty_lead(
-                    name=lead["name"],
-                    address=lead["address"],
-                    website=lead["website"],
-                    hours=lead["hours"],
-                    status=st.session_state[status_key],
-                    notes=st.session_state[notes_key],
-                )
+        demo_href = ensure_https(lead["website"])
+        if website_is_todo(lead["website"]) or not demo_href:
+            st.button("⚠️ Website to be done", key=f"todo_web_{uid}", disabled=True, use_container_width=True)
+        else:
+            st.link_button(
+                "🌐 Open Demo Website",
+                url=demo_href,
+                type="primary",
+                use_container_width=True,
             )
-            if ok:
-                forget_lead_widget_state()
+
+        chosen_status = st.selectbox("Visit Status", options=STATUSES, key=status_key)
+        if chosen_status != lead["status"]:
+            if upsert_cloud_lead({**lead, "status": chosen_status, "notes": st.session_state[notes_key]}):
                 st.rerun()
             else:
-                st.error("Cloud save failed. The note was not confirmed on the server.")
+                st.error("Status konnte nicht in der Cloud gespeichert werden.")
+
+        st.text_area("📝 Field Notes (e.g. Email, Mobile):", key=notes_key)
+        if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="primary"):
+            if upsert_cloud_lead({**lead, "status": st.session_state[status_key], "notes": st.session_state[notes_key]}):
+                st.rerun()
+            else:
+                st.error("Notiz konnte nicht in der Cloud gespeichert werden.")
 
 st.markdown("---")
-with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
-    st.caption("Nur Name und Adresse sind Pflicht. Speichern hat höchste Priorität und überschreibt die Cloud sofort.")
-    with st.form("final_cloud_only_form", clear_on_submit=True):
-        add_name = st.text_input("Name des Geschäfts / Firma", key="form_add_name")
-        add_addr = st.text_input("Adresse (z.B. Hämeentie 38)", key="form_add_addr")
-        add_link = st.text_input("Website / Demo-Link", key="form_add_link")
-        add_hours = st.text_input("Visiting Hours", key="form_add_hours")
+with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
+    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in die Cloud — PC und Tablet sehen denselben Stand.")
+    with st.form("unzerstörbare_cloud_only_form", clear_on_submit=True):
+        add_name = st.text_input("Name des Geschäfts / Firma")
+        add_addr = st.text_input("Adresse (z.B. Hämeentie 38)")
+        add_link = st.text_input("Website / Demo-Link")
+        add_hours = st.text_input("Visiting Hours")
         submitted = st.form_submit_button(
             "💾 LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
             type="primary",
-            disabled=not cloud_live,
         )
 
     if submitted:
@@ -765,19 +662,19 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
         add_link = normalize_website(add_link)
         add_hours = normalize_hours(add_hours)
         if not add_name or not add_addr:
-            st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
+            st.warning("Bitte Name und Adresse ausfüllen.")
         else:
-            new_lead = empty_lead(
-                name=add_name,
-                address=add_addr,
-                website=add_link,
-                hours=add_hours,
-            )
-            new_lead["district"] = infer_district(add_addr)
-            ok = upsert_cloud_lead(new_lead)
-            if ok:
-                forget_lead_widget_state()
+            new_lead = {
+                "name": add_name,
+                "address": add_addr,
+                "website": add_link,
+                "hours": add_hours,
+                "district": infer_district(add_addr),
+                "status": STATUSES[0],
+                "notes": "",
+            }
+            if upsert_cloud_lead(new_lead):
                 st.session_state["home_mode"] = True
                 st.rerun()
             else:
-                st.error("Cloud save failed. The lead was not confirmed on the server.")
+                st.error("Cloud-Speichern fehlgeschlagen. Bitte erneut versuchen.")
