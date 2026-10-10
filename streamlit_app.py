@@ -7,6 +7,7 @@ import urllib.request
 import streamlit as st
 
 API_URL = "https://api.sheety.co/af5130fd4340e5b69490c1da248a8d72/websiteLeads/sheet1"
+STATUS_OPTIONS = ["Not Visited Yet", "In Progress", "Interested", "Not Interested"]
 
 st.set_page_config(
     page_title="Helsinki Website Leads",
@@ -37,33 +38,6 @@ def street_key(lead):
     return clean_text(addr).lower()
 
 
-def normalize_lead(lead):
-    name = clean_text(lead.get("name") or lead.get("Name"))
-    address = clean_text(
-        lead.get("address")
-        or lead.get("adress")
-        or lead.get("Address")
-        or lead.get("Adress")
-    )
-    website = clean_text(lead.get("website") or lead.get("Website"))
-    hours = clean_text(lead.get("hours") or lead.get("Hours"))
-    if website in ("", "https://", "https://."):
-        website = "Website to be done"
-    if not hours:
-        hours = "12:00 - 20:00"
-    return {
-        "id": lead.get("id"),
-        "name": name,
-        "address": address,
-        "adress": address,
-        "website": website,
-        "hours": hours,
-        "district": lead.get("district") or parse_district(address),
-        "status": lead.get("status") or lead.get("Status") or "Not Visited Yet",
-        "notes": lead.get("notes") or lead.get("fieldNotes") or lead.get("Notes") or "",
-    }
-
-
 def parse_district(address_str):
     if not address_str:
         return "Unknown"
@@ -73,7 +47,7 @@ def parse_district(address_str):
         for k in [
             "linja",
             "hameentie",
-            "hämeentie",
+            "h\u00e4meentie",
             "helsinginkatu",
             "vaasankatu",
             "porthaninkatu",
@@ -86,15 +60,62 @@ def parse_district(address_str):
             "runeberginkatu",
             "topeliuksenkatu",
             "toolonkatu",
-            "töölönkatu",
+            "t\u00f6\u00f6l\u00f6nkatu",
             "mechelininkatu",
         ]
     ):
-        return "Töölö"
+        return "T\u00f6\u00f6l\u00f6"
     return "Central District"
 
 
-@st.cache_data(show_spinner=False)
+def split_notes(raw_notes):
+    text = clean_text(raw_notes)
+    if text.startswith("[") and "]" in text:
+        status, rest = text[1:].split("]", 1)
+        status = status.strip()
+        notes = rest.strip()
+        if status not in STATUS_OPTIONS:
+            status = "Not Visited Yet"
+        return status, notes
+    return "Not Visited Yet", text
+
+
+def normalize_lead(lead):
+    name = clean_text(lead.get("name") or lead.get("Name"))
+    address = clean_text(
+        lead.get("address")
+        or lead.get("adress")
+        or lead.get("Address")
+        or lead.get("Adress")
+    )
+    website = clean_text(lead.get("website") or lead.get("Website"))
+    hours = clean_text(lead.get("hours") or lead.get("Hours"))
+    notes_raw = lead.get("notes")
+    if notes_raw is None:
+        notes_raw = lead.get("Notes") or lead.get("fieldNotes") or ""
+    status, notes = split_notes(notes_raw)
+    if "status" in lead and clean_text(lead.get("status")) in STATUS_OPTIONS:
+        status = clean_text(lead.get("status"))
+        if not notes:
+            notes = clean_text(notes_raw)
+            if notes.startswith("[") and "]" in notes:
+                notes = notes.split("]", 1)[1].strip()
+    if website in ("", "https://", "https://."):
+        website = "Website to be done"
+    if not hours:
+        hours = "12:00 - 20:00"
+    return {
+        "id": lead.get("id"),
+        "name": name,
+        "address": address,
+        "website": website,
+        "hours": hours,
+        "notes": notes,
+        "status": status,
+        "district": lead.get("district") or parse_district(address),
+    }
+
+
 def load_leads_from_sheet():
     try:
         req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
@@ -107,13 +128,14 @@ def load_leads_from_sheet():
     return []
 
 
-def post_lead_to_sheet(name, address, website, hours):
+def save_lead_to_sheet(name, address, website, hours):
     payload = {
         "sheet1": {
             "name": name,
-            "adress": address,
+            "address": address,
             "website": website,
             "hours": hours,
+            "notes": "",
         }
     }
     json_data = json.dumps(payload).encode("utf-8")
@@ -130,11 +152,28 @@ def post_lead_to_sheet(name, address, website, hours):
 def save_lead_to_sheet_background(name, address, website, hours):
     def _run():
         try:
-            post_lead_to_sheet(name, address, website, hours)
+            save_lead_to_sheet(name, address, website, hours)
         except Exception:
             pass
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def update_notes_in_sheet(lead_id, current_status, current_notes):
+    payload = {
+        "sheet1": {
+            "notes": "[{0}] {1}".format(current_status, current_notes)
+        }
+    }
+    json_data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "{0}/{1}".format(API_URL, lead_id),
+        data=json_data,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=7) as response:
+        response.read()
 
 
 def delete_lead_from_sheet(lead_id):
@@ -142,7 +181,7 @@ def delete_lead_from_sheet(lead_id):
         return
     try:
         req = urllib.request.Request(
-            f"{API_URL}/{lead_id}",
+            "{0}/{1}".format(API_URL, lead_id),
             headers={"User-Agent": "Mozilla/5.0"},
             method="DELETE",
         )
@@ -170,20 +209,6 @@ def store_notes_locally(lead, current_status, current_notes):
     if not found:
         rows.append(saved)
     st.session_state["local_leads"] = rows
-
-
-def put_notes_to_sheet(lead_id, current_status, current_notes):
-    payload = {"sheet1": {"status": current_status, "notes": current_notes}}
-    json_data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{API_URL}/{lead_id}",
-        data=json_data,
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
-        method="PUT",
-    )
-    with urllib.request.urlopen(req, timeout=7) as response:
-        response.read()
-    load_leads_from_sheet.clear()
 
 
 def merge_leads(cloud_leads, local_leads, deleted_addrs):
@@ -214,17 +239,17 @@ leads = merge_leads(
     st.session_state["deleted_addrs"],
 )
 
-st.title("🎯 Helsinki Website Leads")
+st.title("\U0001f3af Helsinki Website Leads")
 st.write("Synchronisiertes Cloud-Dashboard (PC & Tablet via Google Sheets)")
 if st.session_state.pop("note_flash", None):
     st.success("Notizen gespeichert.")
 
 home_mode = st.checkbox(
-    "🏠 Home Mode (Show all prepared leads)",
+    "\U0001f3e0 Home Mode (Show all prepared leads)",
     value=True,
     key="home_mode_toggle",
 )
-max_distance = st.slider(
+st.slider(
     "Max walking distance from YOUR location (meters)",
     min_value=100,
     max_value=6000,
@@ -234,67 +259,66 @@ max_distance = st.slider(
     key="max_distance",
 )
 
-st.subheader(f"Aktive Leads in der Vertriebs-Pipeline ({len(leads)})")
+st.subheader("Aktive Leads in der Vertriebs-Pipeline ({0})".format(len(leads)))
 if not leads:
     st.info("Keine Leads gefunden. Verwende das Formular unten!")
 
 for idx, lead in enumerate(leads):
     l_name = lead.get("name") or "Unbekannt"
-    l_addr = lead.get("address") or lead.get("adress") or ""
+    l_addr = lead.get("address") or ""
     l_site = lead.get("website") or "Website to be done"
     l_hours = lead.get("hours") or "12:00 - 20:00"
     l_district = lead.get("district") or parse_district(l_addr)
     l_id = lead.get("id")
     if not l_name or not l_addr:
         continue
+
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown(f"## {l_name}")
-            st.write(f"Adresse: {l_addr}")
-            st.write(f"District: {l_district}")
-            st.write(f"Visiting Hours: {l_hours}")
+            st.markdown("## {0}".format(l_name))
+            st.write("Adresse: {0}".format(l_addr))
+            st.write("District: {0}".format(l_district))
+            st.write("Visiting Hours: {0}".format(l_hours))
             if l_site in ("", "Website to be done", "https://"):
-                st.button("Website to be done", key=f"disabled_{idx}", disabled=True)
+                st.button("Website to be done", key="disabled_{0}".format(idx), disabled=True)
             else:
                 st.link_button("Open Demo Website", l_site, type="primary")
-            status_key = f"status_{idx}"
-            notes_key = f"notes_{idx}"
+
+            status_key = "status_{0}".format(idx)
+            notes_key = "notes_{0}".format(idx)
             if status_key not in st.session_state:
                 st.session_state[status_key] = lead.get("status") or "Not Visited Yet"
             if notes_key not in st.session_state:
                 st.session_state[notes_key] = lead.get("notes") or ""
-            st.selectbox(
-                "Visit Status",
-                ["Not Visited Yet", "In Progress", "Interested", "Not Interested"],
-                key=status_key,
-            )
-            st.text_area("Field Notes", key=notes_key, height=70)
-            if st.button("💾 Save Note", key=f"save_btn_{idx}"):
+
+            st.selectbox("Status", STATUS_OPTIONS, key=status_key)
+            st.text_area("\U0001f4dd Field Notes", key=notes_key, height=70)
+
+            if st.button("\U0001f4be Save Note", key="save_note_{0}".format(idx), type="primary"):
                 current_status = st.session_state.get(status_key, "Not Visited Yet")
                 current_notes = st.session_state.get(notes_key, "")
                 store_notes_locally(lead, current_status, current_notes)
-                saved_ok = True
                 if l_id:
                     try:
-                        put_notes_to_sheet(l_id, current_status, current_notes)
+                        update_notes_in_sheet(l_id, current_status, current_notes)
                     except Exception as exc:
-                        saved_ok = False
-                        st.error(f"Notizen lokal gespeichert, Cloud-Update fehlgeschlagen: {exc}")
-                if saved_ok:
-                    load_leads_from_sheet.clear()
+                        st.error("Cloud-Update fehlgeschlagen: {0}".format(exc))
+                    else:
+                        st.session_state["note_flash"] = True
+                        st.rerun()
+                else:
                     st.session_state["note_flash"] = True
                     st.rerun()
+
             if st.button(
-                "❌ Lead aus Pipeline löschen",
-                key=f"delete_{idx}",
+                "\u274c Lead aus Pipeline l\u00f6schen",
+                key="delete_{0}".format(idx),
                 type="secondary",
             ):
                 addr_k = street_key(lead)
                 st.session_state["local_leads"] = [
-                    row
-                    for row in st.session_state["local_leads"]
-                    if street_key(row) != addr_k
+                    row for row in st.session_state["local_leads"] if street_key(row) != addr_k
                 ]
                 deleted = list(st.session_state["deleted_addrs"])
                 if addr_k and addr_k not in deleted:
@@ -302,21 +326,22 @@ for idx, lead in enumerate(leads):
                 st.session_state["deleted_addrs"] = deleted
                 delete_lead_from_sheet(l_id)
                 st.rerun()
+
         with col2:
-            encoded_addr = urllib.parse.quote(f"{l_addr}, Helsinki")
-            map_src = f"https://maps.google.com/maps?q={encoded_addr}&output=embed"
+            encoded_addr = urllib.parse.quote("{0}, Helsinki".format(l_addr))
+            map_src = "https://maps.google.com/maps?q={0}&output=embed".format(encoded_addr)
             st.components.v1.iframe(map_src, height=140)
 
 st.divider()
 
-with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
+with st.expander("\u2795 Neuen Lead manuell hinzuf\u00fcgen", expanded=True):
     with st.form("google_sheets_sync_form", clear_on_submit=True):
-        add_name = st.text_input("Name des Geschäfts / Firma:")
-        add_addr = st.text_input("Adresse (z.B. Hämeentie 12):")
+        add_name = st.text_input("Name des Gesch\u00e4fts / Firma:")
+        add_addr = st.text_input("Adresse (z.B. H\u00e4meentie 12):")
         add_link = st.text_input("Website / Demo-Link (optional):", value="https://")
         add_hours = st.text_input("Visiting Hours (optional):", value="12:00 - 20:00")
         submitted = st.form_submit_button(
-            "💾 LEAD DASHBOARD-WEIT SPEICHERN",
+            "\U0001f4be LEAD DASHBOARD-WEIT SPEICHERN",
             use_container_width=True,
             type="primary",
         )
@@ -329,24 +354,20 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                     if add_link.strip() in ("", "https://", "https://.")
                     else add_link.strip()
                 )
-                final_hours = (
-                    "12:00 - 20:00" if not add_hours.strip() else add_hours.strip()
-                )
-                district = parse_district(add_addr.strip())
+                final_hours = "12:00 - 20:00" if not add_hours.strip() else add_hours.strip()
                 new_lead = {
                     "name": add_name.strip(),
                     "address": add_addr.strip(),
-                    "adress": add_addr.strip(),
                     "website": final_link,
                     "hours": final_hours,
-                    "district": district,
-                    "status": "Not Visited Yet",
                     "notes": "",
+                    "status": "Not Visited Yet",
+                    "district": parse_district(add_addr.strip()),
                 }
                 st.session_state["local_leads"].append(new_lead)
                 save_lead_to_sheet_background(
                     new_lead["name"],
-                    new_lead["adress"],
+                    new_lead["address"],
                     new_lead["website"],
                     new_lead["hours"],
                 )
