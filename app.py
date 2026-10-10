@@ -14,11 +14,11 @@ HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
 WEBSITE_TODO = "Website to be done"
 HOURS_FALLBACK = "12:00 - 20:00"
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 12
 
-CLOUD_URL = "https://restful-api.dev"
-CLOUD_OBJECT_ID = "ff808181a09d98f701a124c4adf433f1"
-CLOUD_SLOT = f"https://api.restful-api.dev/objects/{CLOUD_OBJECT_ID}"
+BASE_URL = "https://restful-api.dev"
+DB_ID = "ff808181a09d98f701a11a66d4f61e14"
+CLOUD_SLOT = f"https://api.restful-api.dev/objects/{DB_ID}"
 CLOUD_NAME = "helsinki-radar"
 
 STATUSES = [
@@ -123,7 +123,57 @@ if "editing_sid" not in st.session_state:
     st.session_state["editing_sid"] = ""
 
 
-def cloud_request(method: str, url: str, payload: dict | None = None) -> tuple[int, object | None]:
+def is_blank_null(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "ignore")
+    if isinstance(value, str):
+        text = value.strip().strip('"').strip("'")
+        return (not text) or text.lower() in {"null", "none", "undefined", "nan", "[]", "{}"}
+    return False
+
+
+def as_leads_list(value: object) -> list:
+    """Always return a real Python list. Never None. Never crash on null/empty."""
+    if value is None or is_blank_null(value):
+        return []
+    if isinstance(value, list):
+        clean: list = []
+        for item in value:
+            if isinstance(item, dict) and clean_text(item.get("name")) and clean_text(item.get("address")):
+                clean.append(item)
+        return clean
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", "ignore")
+        except Exception:
+            return []
+    if isinstance(value, str):
+        text = value.strip()
+        if is_blank_null(text):
+            return []
+        try:
+            return as_leads_list(json.loads(text))
+        except Exception:
+            return []
+    if isinstance(value, dict):
+        if "leads" in value:
+            return as_leads_list(value.get("leads"))
+        nested = value.get("data")
+        if nested is not None and nested is not value:
+            extracted = as_leads_list(nested)
+            if extracted or is_blank_null(nested) or nested == [] or nested == {}:
+                return extracted
+        if clean_text(value.get("name")) and clean_text(value.get("address")):
+            return [value]
+        return []
+    return []
+
+
+def cloud_exchange(method: str, url: str, payload: dict | None = None) -> object:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, method=method)
     request.add_header("Accept", "application/json")
@@ -133,83 +183,83 @@ def cloud_request(method: str, url: str, payload: dict | None = None) -> tuple[i
     context = ssl.create_default_context()
     try:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
-            status = int(response.status)
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        return int(exc.code), None
+        try:
+            raw = exc.read()
+        except Exception:
+            return None
+        if not raw:
+            return None
     except Exception:
-        return 0, None
+        return None
     if not raw:
-        return status, None
+        return None
+    text = raw.decode("utf-8", "ignore").strip()
+    if is_blank_null(text):
+        return None
     try:
-        return status, json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError:
-        return status, None
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    if parsed is None:
+        return None
+    return parsed
 
 
-def parse_leads_document(document: object) -> list:
-    if not isinstance(document, dict):
-        return []
-    data = document.get("data", document)
-    rows = []
-    if isinstance(data, dict):
-        rows = data.get("leads") or []
-    elif isinstance(data, list):
-        rows = data
-    if isinstance(document.get("leads"), list):
-        rows = document["leads"]
-    return rows if isinstance(rows, list) else []
+def empty_cloud_payload() -> dict:
+    return {"name": CLOUD_NAME, "data": {"leads": []}}
 
 
-def load_cloud_leads() -> list[dict]:
-    status, document = cloud_request("GET", CLOUD_SLOT)
-    if status != 200 or document is None:
-        return []
-    rows = parse_leads_document(document)
-    leads: list[dict] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = clean_text(row.get("name"))
-        address = clean_text(row.get("address"))
-        if not name or not address:
-            continue
-        leads.append(
-            empty_lead(
-                name=name,
-                address=address,
-                website=row.get("website", ""),
-                hours=row.get("hours", ""),
-                status=row.get("status", ""),
-                notes=row.get("notes", ""),
-            )
-        )
-    return leads
+def initialize_cloud_slot() -> list:
+    cloud_exchange("PUT", CLOUD_SLOT, empty_cloud_payload())
+    return []
 
 
-def save_cloud_leads(leads: list[dict]) -> str:
-    packed = [
-        serialize_lead(lead)
-        for lead in leads
-        if clean_text(lead.get("name")) and clean_text(lead.get("address"))
-    ]
+def load_cloud_leads() -> list:
+    document = cloud_exchange("GET", CLOUD_SLOT)
+    if document is None or is_blank_null(document):
+        return initialize_cloud_slot()
+    leads = as_leads_list(document)
+    if not leads:
+        data = document.get("data") if isinstance(document, dict) else None
+        if data is None or is_blank_null(data):
+            initialize_cloud_slot()
+            return []
+    return leads if isinstance(leads, list) else []
+
+
+def save_cloud_leads(leads: object) -> bool:
+    safe = as_leads_list(leads)
+    packed = []
+    for item in safe:
+        packed.append(serialize_lead(item))
     payload = {"name": CLOUD_NAME, "data": {"leads": packed}}
-    status, _ = cloud_request("PUT", CLOUD_SLOT, payload)
-    if status in {200, 201}:
-        return ""
-    status, created = cloud_request("POST", "https://api.restful-api.dev/objects", payload)
-    if status in {200, 201}:
-        return ""
-    return f"Cloud save failed ({CLOUD_URL})"
+    result = cloud_exchange("PUT", CLOUD_SLOT, payload)
+    if result is None:
+        result = cloud_exchange("POST", "https://api.restful-api.dev/objects", payload)
+    return result is not None
 
 
-def upsert_cloud_lead(lead: dict) -> str:
+def upsert_cloud_lead(lead: dict) -> bool:
     current = load_cloud_leads()
-    merged: dict[str, dict] = {}
+    if not isinstance(current, list):
+        current = []
+    incoming = serialize_lead(lead)
+    key = address_key(incoming["address"])
+    updated: list = []
+    replaced = False
     for item in current:
-        merged[address_key(item["address"])] = serialize_lead(item)
-    merged[address_key(lead["address"])] = serialize_lead(lead)
-    return save_cloud_leads(list(merged.values()))
+        if not isinstance(item, dict):
+            continue
+        if address_key(clean_text(item.get("address"))) == key:
+            updated.append(incoming)
+            replaced = True
+        else:
+            updated.append(serialize_lead(item) if item.get("name") else item)
+    if not replaced:
+        updated.append(incoming)
+    return save_cloud_leads(updated)
 
 
 def clean_text(value: object) -> str:
@@ -430,12 +480,14 @@ st.markdown(
 )
 
 all_leads = load_cloud_leads()
-st.caption(f"Cloud sync via {CLOUD_URL} · {len(all_leads)} lead(s) in the pipeline.")
+if not isinstance(all_leads, list):
+    all_leads = []
+st.caption(f"Cloud sync via {BASE_URL} · {len(all_leads)} lead(s) in the pipeline.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
 with filter_left:
-    home_mode = st.session_state.get("home_mode", False)
+    home_mode = bool(st.session_state.get("home_mode", False))
     st.slider(
         "Max walking distance from YOUR location (meters)",
         min_value=100,
@@ -446,7 +498,7 @@ with filter_left:
         key="max_distance",
     )
     st.checkbox("🏠 Home Mode (Show all prepared leads)", key="home_mode")
-    home_mode = st.session_state["home_mode"]
+    home_mode = bool(st.session_state.get("home_mode", False))
 with filter_right:
     industry_keyword = st.text_input(
         "Industry Keyword Filter (e.g., Ravintola, Café, Barber)",
@@ -455,25 +507,34 @@ with filter_right:
     district_filter = st.selectbox("District Filter", options=DISTRICT_OPTIONS, key="district_filter")
 
 origin_lat, origin_lon = HELSINKI_CENTRAL
-keyword = industry_keyword.strip().lower()
+keyword = (industry_keyword or "").strip().lower()
 
 enriched_rows: list[dict] = []
 for lead in all_leads:
-    lat, lon = coords_for_address(lead["address"])
+    if not isinstance(lead, dict):
+        continue
+    display = empty_lead(
+        name=lead.get("name", ""),
+        address=lead.get("address", ""),
+        website=lead.get("website", ""),
+        hours=lead.get("hours", ""),
+        status=lead.get("status", ""),
+        notes=lead.get("notes", ""),
+    )
+    lat, lon = coords_for_address(display["address"])
     distance_m = haversine_m(origin_lat, origin_lon, lat, lon)
-    if not district_matches(lead["district"], district_filter):
+    if not district_matches(display["district"], district_filter):
         continue
     if keyword:
-        blob = f"{lead['name']} {lead['address']} {lead['district']}".lower()
+        blob = f"{display['name']} {display['address']} {display['district']}".lower()
         if keyword not in blob:
             continue
-    if not home_mode and distance_m > float(st.session_state["max_distance"]):
+    if not home_mode and distance_m > float(st.session_state.get("max_distance", 2000)):
         continue
-    item = dict(lead)
-    item["latitude"] = lat
-    item["longitude"] = lon
-    item["distance_m"] = distance_m
-    enriched_rows.append(item)
+    display["latitude"] = lat
+    display["longitude"] = lon
+    display["distance_m"] = distance_m
+    enriched_rows.append(display)
 
 enriched_rows.sort(
     key=lambda item: (0 if item["status"] == STATUSES[0] else 1, item["distance_m"], item["name"])
@@ -522,7 +583,7 @@ for lead in enriched_rows:
                         new_link = normalize_website(st.session_state[f"edit_link_{uid}"])
                         new_hours = normalize_hours(st.session_state[f"edit_hours_{uid}"])
                         if new_name and new_addr:
-                            save_err = upsert_cloud_lead(
+                            ok = upsert_cloud_lead(
                                 empty_lead(
                                     name=new_name,
                                     address=new_addr,
@@ -532,11 +593,11 @@ for lead in enriched_rows:
                                     notes=st.session_state[notes_key],
                                 )
                             )
-                            if save_err:
-                                st.error(save_err)
-                            else:
+                            if ok:
                                 st.session_state["editing_sid"] = ""
                                 st.rerun()
+                            else:
+                                st.error("Cloud save failed. Please try again.")
                         else:
                             st.warning("Name and address are required.")
                 with cancel_col:
@@ -571,7 +632,7 @@ for lead in enriched_rows:
                 label_visibility="collapsed",
             )
             if chosen_status != lead["status"]:
-                save_err = upsert_cloud_lead(
+                ok = upsert_cloud_lead(
                     empty_lead(
                         name=lead["name"],
                         address=lead["address"],
@@ -581,10 +642,10 @@ for lead in enriched_rows:
                         notes=st.session_state[notes_key],
                     )
                 )
-                if save_err:
-                    st.error(save_err)
-                else:
+                if ok:
                     st.rerun()
+                else:
+                    st.error("Cloud save failed. Please try again.")
 
             demo_href = live_website_url(lead["website"])
             if website_is_todo(lead["website"]) or not demo_href:
@@ -611,7 +672,7 @@ for lead in enriched_rows:
 
         st.text_area("✍️ Field Notes (e.g. Email, Mobile):", key=notes_key)
         if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="secondary"):
-            save_err = upsert_cloud_lead(
+            ok = upsert_cloud_lead(
                 empty_lead(
                     name=lead["name"],
                     address=lead["address"],
@@ -621,10 +682,10 @@ for lead in enriched_rows:
                     notes=st.session_state[notes_key],
                 )
             )
-            if save_err:
-                st.error(save_err)
-            else:
+            if ok:
                 st.rerun()
+            else:
+                st.error("Cloud save failed. Please try again.")
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
@@ -654,8 +715,9 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                 website=add_link,
                 hours=add_hours,
             )
-            save_err = upsert_cloud_lead(new_lead)
-            if save_err:
-                st.error(save_err)
-            else:
+            new_lead["district"] = infer_district(add_addr)
+            ok = upsert_cloud_lead(new_lead)
+            if ok:
                 st.rerun()
+            else:
+                st.error("Cloud save failed. Please try again.")
