@@ -201,13 +201,27 @@ distance_filter = st.slider(
     value=6000,
 )
 home_mode = st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_widget")
+selected_district_filter = st.selectbox(
+    "🌍 Filter by District",
+    ["All Districts", "Kallio", "Töölö", "Kalasatama", "Central District"],
+)
 
-st.subheader(f"Aktive Leads in der Vertriebs-Pipeline ({len(all_leads)})")
+filtered_leads_count = 0
+for lead in all_leads:
+    lead_district = parse_district(lead.get("address", ""))
+    if selected_district_filter != "All Districts" and lead_district != selected_district_filter:
+        continue
+    filtered_leads_count += 1
+
+st.subheader(f"Aktive Leads in der Vertriebs-Pipeline ({filtered_leads_count})")
 
 if not all_leads:
     st.info("Keine Leads im Google Sheet gefunden. Verwende das Formular unten!")
 
 for idx, lead in enumerate(all_leads):
+    lead_district = parse_district(lead.get("address", ""))
+    if selected_district_filter != "All Districts" and lead_district != selected_district_filter:
+        continue
     current_edit_id = lead_edit_key(lead, idx)
     with st.container(border=True):
         if st.session_state["edit_lead_id"] == current_edit_id:
@@ -305,7 +319,7 @@ for idx, lead in enumerate(all_leads):
                         st.session_state["edit_lead_id"] = current_edit_id
                         st.rerun()
                 with btn3:
-                    if st.button("❌ L?schen", key=f"delete_{idx}", type="secondary"):
+                    if st.button("❌ Löschen", key=f"delete_{idx}", type="secondary"):
                         st.session_state["local_leads"] = [
                             x
                             for x in st.session_state["local_leads"]
