@@ -13,9 +13,11 @@ import streamlit as st
 
 API_URL = "https://sheety.co"
 SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
-SHEET1_GET_URL = f"https://opensheet.elk.sh/{SHEET_ID}/sheet1"
+SHEET1_GET_URL = "https://opensheet.elk.sh/" + SHEET_ID + "/sheet1"
 GVIZ_URL = (
-    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:json&gid=0"
+    "https://docs.google.com/spreadsheets/d/"
+    + SHEET_ID
+    + "/gviz/tq?tqx=out:json&gid=0"
 )
 HTTP_TIMEOUT = 12
 
@@ -153,7 +155,7 @@ def ensure_https(raw: object) -> str:
         return ""
     if text.lower().startswith(("http://", "https://")):
         return text
-    return f"https://{text.lstrip('/')}"
+    return "https://" + text.lstrip("/")
 
 
 def fold_fi(text: str) -> str:
@@ -230,7 +232,7 @@ def coords_for_address(address: str) -> tuple[float, float]:
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6_371_000.0
+    radius = 6371000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
     d_lambda = math.radians(lon2 - lon1)
@@ -245,7 +247,7 @@ def walking_minutes(meters: float) -> int:
 
 
 def native_geo_url(lat: float, lon: float) -> str:
-    return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
+    return "https://www.google.com/maps/search/?api=1&query={:.6f},{:.6f}".format(lat, lon)
 
 
 def pack_lead(row: dict) -> dict | None:
@@ -263,7 +265,7 @@ def pack_lead(row: dict) -> dict | None:
         "status": normalize_status(row_get(row, "status")),
         "notes": row_get(row, "notes"),
         "district": infer_district(address),
-        "sid": f"a_{address_key(address)[:24] or 'unknown'}",
+        "sid": "a_" + (address_key(address)[:24] or "unknown"),
     }
 
 
@@ -303,7 +305,7 @@ def http_call(method: str, url: str, payload: dict | None = None) -> object:
     fetch_url = url
     if method == "GET":
         stamp = urllib.parse.quote(str(time.time()), safe="")
-        fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
+        fetch_url = url + ("&" if "?" in url else "?") + "nocache=" + stamp
     request = urllib.request.Request(fetch_url, data=body, method=method)
     request.add_header("Accept", "application/json, text/plain, */*")
     request.add_header("User-Agent", "HelsinkiRadar/1.0")
@@ -351,7 +353,7 @@ def parse_gviz(document: object) -> list[dict]:
         cells = row.get("c") or []
         item: dict = {}
         for index, cell in enumerate(cells):
-            label = labels[index] if index < len(labels) else f"col{index}"
+            label = labels[index] if index < len(labels) else "col{}".format(index)
             value = ""
             if isinstance(cell, dict):
                 value = cell.get("v")
@@ -375,38 +377,34 @@ def load_cloud_leads() -> list[dict]:
     return parsed if parsed else []
 
 
-def post_sheet_lead(name: str, address: str, website: str, hours: str) -> bool:
-    payload = {
-        "sheet1": {
-            "name": name,
-            "address": address,
-            "website": website,
-            "hours": hours,
-        }
-    }
-    result = http_call("POST", API_URL, payload)
-    if isinstance(result, dict) and (
-        result.get("sheet1") or result.get("success") or pack_lead(result)
-    ):
+def delete_lead_from_sheet(lead_id: object) -> bool:
+    row_id = clean_text(lead_id)
+    if not row_id:
+        return False
+    url = API_URL + "/" + row_id
+    request = urllib.request.Request(url, method="DELETE")
+    request.add_header("User-Agent", "HelsinkiRadar/1.0")
+    request.add_header("Accept", "application/json, text/plain, */*")
+    context = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+            response.read()
         return True
-    return False
+    except urllib.error.HTTPError as exc:
+        return 200 <= int(exc.code) < 300
+    except Exception:
+        return False
 
 
 def render_google_map(address: str) -> None:
-    encoded_address = urllib.parse.quote(f"{address}, Helsinki, Finland")
-    src = f"https://maps.google.com/maps?q={encoded_address}&output=embed"
-    st.components.v1.html(
-        f"""
-<iframe
-    width="100%"
-    height="140"
-    frameborder="0"
-    style="border:0; border-radius:8px; background-color:#ffffff;"
-    src="{src}">
-</iframe>
-""",
-        height=145,
+    encoded_address = urllib.parse.quote(address + ", Helsinki, Finland")
+    src = "https://maps.google.com/maps?q=" + encoded_address + "&output=embed"
+    html = (
+        '<iframe width="100%" height="140" frameborder="0" '
+        'style="border:0; border-radius:8px; background-color:#ffffff;" '
+        'src="' + src + '"></iframe>'
     )
+    st.components.v1.html(html, height=145)
 
 
 st.markdown(
@@ -457,7 +455,7 @@ all_leads = load_cloud_leads()
 if not isinstance(all_leads, list):
     all_leads = []
 
-st.caption(f"Google Sheets / Sheety · {len(all_leads)} Lead(s) geladen.")
+st.caption("Google Sheets / Sheety · {} Lead(s) geladen.".format(len(all_leads)))
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -493,7 +491,7 @@ for lead in all_leads:
     if not district_matches(packed["district"], district_filter):
         continue
     if keyword:
-        blob = f"{packed['name']} {packed['address']} {packed['district']}".lower()
+        blob = "{} {} {}".format(packed["name"], packed["address"], packed["district"]).lower()
         if keyword not in blob:
             continue
     if not home_mode and distance_m > float(st.session_state.get("max_distance", 6000)):
@@ -507,15 +505,15 @@ visible.sort(key=lambda item: (0 if item["status"] == STATUSES[0] else 1, item["
 
 st.markdown("---")
 st.subheader("Active Lead Pipeline")
-st.caption(f"{len(visible)} sichtbar · {len(all_leads)} in Google Sheets.")
+st.caption("{} sichtbar · {} in Google Sheets.".format(len(visible), len(all_leads)))
 
 if not visible:
     st.info("Keine Leads sichtbar. Home Mode aktivieren oder unten einen Lead speichern.")
 
-for lead in visible:
+for idx, lead in enumerate(visible):
     uid = lead["sid"]
-    status_key = f"status_{uid}"
-    notes_key = f"notes_{uid}"
+    status_key = "status_{}".format(uid)
+    notes_key = "notes_{}".format(uid)
     if status_key not in st.session_state:
         st.session_state[status_key] = lead["status"]
     if notes_key not in st.session_state:
@@ -524,13 +522,13 @@ for lead in visible:
     with st.container(border=True):
         left, right = st.columns([1.3, 1.0])
         with left:
-            st.markdown(f"### {lead['name']}")
+            st.markdown("### {}".format(lead["name"]))
             st.markdown(
-                f"<div class='addr-line'>Address: {lead['address']}, Helsinki</div>",
+                "<div class='addr-line'>Address: {}, Helsinki</div>".format(lead["address"]),
                 unsafe_allow_html=True,
             )
             st.markdown(
-                f"<span class='district-badge'>District: {lead['district']}</span>",
+                "<span class='district-badge'>District: {}</span>".format(lead["district"]),
                 unsafe_allow_html=True,
             )
             if home_mode:
@@ -538,22 +536,22 @@ for lead in visible:
             else:
                 meters = int(round(lead["distance_m"]))
                 minutes = walking_minutes(lead["distance_m"])
-                st.markdown(f"Distance to you: {meters} m (ca. {minutes} min walk)")
+                st.markdown("Distance to you: {} m (ca. {} min walk)".format(meters, minutes))
         with right:
             st.markdown(
-                f"<div class='hours-line'>Visiting Hours: <code>{lead['hours']}</code></div>",
+                "<div class='hours-line'>Visiting Hours: <code>{}</code></div>".format(lead["hours"]),
                 unsafe_allow_html=True,
             )
             geo_url = native_geo_url(lead["latitude"], lead["longitude"])
             st.markdown(
-                f'<a class="nav-link" href="{geo_url}" target="_blank" rel="noopener noreferrer">🗺️ Navigation</a>',
+                '<a class="nav-link" href="{}" target="_blank" rel="noopener noreferrer">🗺️ Navigation</a>'.format(geo_url),
                 unsafe_allow_html=True,
             )
             render_google_map(lead["address"])
 
         demo_href = ensure_https(lead["website"])
         if website_is_todo(lead["website"]) or not demo_href:
-            st.button("⚠️ Website to be done", key=f"todo_web_{uid}", disabled=True, use_container_width=True)
+            st.button("⚠️ Website to be done", key="todo_web_{}".format(uid), disabled=True, use_container_width=True)
         else:
             st.link_button(
                 "🌐 Open Demo Website",
@@ -564,14 +562,21 @@ for lead in visible:
 
         st.selectbox("Visit Status", options=STATUSES, key=status_key)
         st.text_area("📝 Field Notes (e.g. Email, Mobile):", key=notes_key)
-        if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="primary"):
-            if post_sheet_lead(
-                lead["name"],
-                lead["address"],
-                lead["website"],
-                lead["hours"],
-            ):
-                st.rerun()
+        if st.button("💾 Save Note", key="save_note_{}".format(uid), use_container_width=True, type="primary"):
+            payload = {
+                "sheet1": {
+                    "name": lead["name"],
+                    "address": lead["address"],
+                    "website": lead["website"],
+                    "hours": lead["hours"],
+                }
+            }
+            http_call("POST", API_URL, payload)
+            st.rerun()
+
+        if st.button("❌ Lead aus Pipeline löschen", key="delete_{}".format(idx), type="secondary"):
+            delete_lead_from_sheet(lead["id"])
+            st.rerun()
 
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
@@ -604,12 +609,18 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                     "hours": add_hours,
                 }
             }
-            posted = http_call("POST", API_URL, payload)
-            ok = isinstance(posted, dict) and bool(
-                posted.get("sheet1") or pack_lead(posted) or posted.get("success")
+            request = urllib.request.Request(
+                API_URL,
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                method="POST",
             )
-            if ok:
-                st.session_state["home_mode"] = True
-                st.rerun()
-            else:
-                st.error("Speichern über Sheety ist fehlgeschlagen. Bitte erneut versuchen.")
+            request.add_header("Content-Type", "application/json; charset=utf-8")
+            request.add_header("User-Agent", "HelsinkiRadar/1.0")
+            context = ssl.create_default_context()
+            try:
+                with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+                    response.read()
+            except Exception:
+                pass
+            st.session_state["home_mode"] = True
+            st.rerun()
