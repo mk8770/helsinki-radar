@@ -6,7 +6,7 @@ import urllib.request
 
 import streamlit as st
 
-API_URL = "https://api.sheety.co/af5130fd4340e5b69490c1da248a8d72/websiteLeads/sheet1"
+API_URL = "https://sheety.co"
 STATUS_OPTIONS = ["Not Visited Yet", "In Progress", "Interested", "Not Interested"]
 
 st.set_page_config(
