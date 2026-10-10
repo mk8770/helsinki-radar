@@ -5,7 +5,7 @@ import urllib.parse
 import urllib.error
 
 # Ihre VOLLSTÄNDIGE, permanente Sheety-Verbindung direkt zu Ihrem Google Sheet
-API_URL = "https://sheety.co"
+API_URL = "https://api.sheety.co/af5130fd4340e5b69490c1da248a8d72/websiteLeads/sheet1"
 
 st.set_page_config(page_title="🎯 Helsinki Website Leads", layout="wide", initial_sidebar_state="collapsed")
 
