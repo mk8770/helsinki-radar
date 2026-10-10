@@ -18,13 +18,18 @@ HELSINKI_CENTRAL = (60.1708, 24.9414)
 WALK_METERS_PER_MIN = 80.0
 WEBSITE_TODO = "Website to be done"
 HOURS_FALLBACK = "12:00 - 20:00"
+HTTP_TIMEOUT = 10
 
-# Public mock JSON store — no login, no API tokens. GET + PUT share one object
-# so every device opening the base bookmark sees the same manual leads.
-CLOUD_OBJECT_ID = "ff808181a09d98f701a11a66d4f61e14"
-CLOUD_URL = f"https://api.restful-api.dev/objects/{CLOUD_OBJECT_ID}"
-CLOUD_NAME = "helsinki-field-leads"
-HTTP_TIMEOUT = 8
+# Unique app identifier — every device uses the same named cloud slot.
+REPO_NAME = "helsinki-radar"
+KV_APP_KEY = "helsinki-radar"
+KV_BIN_ITEM = "binid"
+KV_GET = f"https://keyvalue.immanuel.co/api/KeyVal/GetValue/{KV_APP_KEY}/{KV_BIN_ITEM}"
+KV_PUT_PREFIX = f"https://keyvalue.immanuel.co/api/KeyVal/UpdateValue/{KV_APP_KEY}/{KV_BIN_ITEM}/"
+BLOB_API = "https://superjsonblob.com/api/jsonBlob"
+RENTRY_URL = "helsinki-radar"
+RENTRY_EDIT_CODE = "radarsync"
+EMPTY_CLOUD = {"app": REPO_NAME, "leads": []}
 
 STATUSES = [
     "🆕 Not Visited Yet",
@@ -128,13 +133,241 @@ if "editing_sid" not in st.session_state:
     st.session_state["editing_sid"] = ""
 
 
+def http_call(
+    method: str,
+    url: str,
+    payload: object | None = None,
+    form: dict[str, str] | None = None,
+) -> tuple[int, object | None]:
+    body: bytes | None = None
+    content_type = ""
+    if form is not None:
+        body = urllib.parse.urlencode(form).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded"
+    elif payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        content_type = "application/json"
+    request = urllib.request.Request(url, data=body, method=method)
+    request.add_header("Accept", "application/json, text/plain, */*")
+    request.add_header("User-Agent", "HelsinkiRadar/1.0")
+    if content_type:
+        request.add_header("Content-Type", content_type)
+    context = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+            status = int(response.status)
+            raw = response.read()
+            location = response.headers.get("Location") or response.headers.get("location") or ""
+    except urllib.error.HTTPError as exc:
+        raw = exc.read() if hasattr(exc, "read") else b""
+        return int(exc.code), {"error": str(exc), "body": raw.decode("utf-8", "ignore")[:400]}
+    except Exception as exc:
+        return 0, {"error": str(exc)}
+    text = raw.decode("utf-8", "ignore") if raw else ""
+    if not text:
+        return status, {"location": location} if location else None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return status, text
+    if location and isinstance(parsed, dict) and "location" not in parsed:
+        parsed["location"] = location
+    elif location and not isinstance(parsed, dict):
+        return status, {"data": parsed, "location": location}
+    return status, parsed
+
+
 def clean_text(value: object) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return ""
     text = str(value).strip()
     if text.lower() in {"nan", "none", "null"}:
         return ""
-    return text
+    return text.strip().strip('"')
+
+
+def kv_read_bin_id() -> str:
+    status, data = http_call("GET", KV_GET)
+    if status != 200:
+        return ""
+    if isinstance(data, str):
+        return clean_text(data)
+    if isinstance(data, dict):
+        return clean_text(data.get("value") or data.get("body") or "")
+    return ""
+
+
+def kv_write_bin_id(bin_id: str) -> bool:
+    token = clean_text(bin_id)
+    if not token:
+        return False
+    status, _ = http_call("POST", KV_PUT_PREFIX + urllib.parse.quote(token, safe="-"))
+    return status == 200
+
+
+def blob_get(bin_id: str) -> dict | None:
+    status, data = http_call("GET", f"{BLOB_API}/{bin_id}")
+    if status == 200 and isinstance(data, dict) and "error" not in data:
+        return data
+    return None
+
+
+def blob_put(bin_id: str, document: dict) -> bool:
+    status, _ = http_call("PUT", f"{BLOB_API}/{bin_id}", document)
+    return status in {200, 201}
+
+
+def blob_create() -> str:
+    status, data = http_call("POST", BLOB_API, dict(EMPTY_CLOUD))
+    if status not in {200, 201}:
+        return ""
+    if isinstance(data, dict):
+        token = clean_text(data.get("id"))
+        if token:
+            return token
+        location = clean_text(data.get("location"))
+        if location:
+            return location.rstrip("/").split("/")[-1]
+    return ""
+
+
+def rentry_fetch_text() -> str | None:
+    status, data = http_call(
+        "POST",
+        f"https://rentry.co/api/fetch/{RENTRY_URL}",
+        form={"edit_code": RENTRY_EDIT_CODE},
+    )
+    if status != 200 or not isinstance(data, dict):
+        return None
+    if str(data.get("status")) not in {"200", "ok", "OK"}:
+        return None
+    content = data.get("content")
+    if isinstance(content, dict):
+        return str(content.get("text") or "")
+    if isinstance(content, str):
+        return content
+    return None
+
+
+def rentry_save_text(text: str) -> bool:
+    status, data = http_call(
+        "POST",
+        f"https://rentry.co/api/edit/{RENTRY_URL}",
+        form={"edit_code": RENTRY_EDIT_CODE, "text": text},
+    )
+    if status == 200 and isinstance(data, dict) and str(data.get("status")) in {"200", "ok", "OK"}:
+        return True
+    created, create_data = http_call(
+        "POST",
+        "https://rentry.co/api/new",
+        form={"url": RENTRY_URL, "edit_code": RENTRY_EDIT_CODE, "text": text},
+    )
+    if created == 200 and isinstance(create_data, dict) and str(create_data.get("status")) in {"200", "ok", "OK"}:
+        return True
+    status, data = http_call(
+        "POST",
+        f"https://rentry.co/api/edit/{RENTRY_URL}",
+        form={"edit_code": RENTRY_EDIT_CODE, "text": text},
+    )
+    return status == 200 and isinstance(data, dict) and str(data.get("status")) in {"200", "ok", "OK"}
+
+
+def parse_cloud_document(document: object) -> list[dict]:
+    rows: list = []
+    if isinstance(document, dict):
+        if isinstance(document.get("leads"), list):
+            rows = document["leads"]
+        elif isinstance(document.get("data"), dict) and isinstance(document["data"].get("leads"), list):
+            rows = document["data"]["leads"]
+        elif isinstance(document.get("data"), list):
+            rows = document["data"]
+    elif isinstance(document, list):
+        rows = document
+    elif isinstance(document, str) and document.strip():
+        try:
+            return parse_cloud_document(json.loads(document))
+        except json.JSONDecodeError:
+            return []
+    leads: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = clean_text(row.get("name"))
+        address = clean_text(row.get("address"))
+        if not name or not address:
+            continue
+        leads.append(
+            empty_lead(
+                name=name,
+                address=address,
+                website=row.get("website", ""),
+                hours=row.get("hours", ""),
+                status=row.get("status", ""),
+                notes=row.get("notes", ""),
+                src="cloud",
+            )
+        )
+    return leads
+
+
+def ensure_cloud_storage() -> dict:
+    """Create the shared helsinki-radar cloud bin automatically if it does not exist."""
+    cached = st.session_state.get("cloud_bin_id")
+    if cached:
+        document = blob_get(cached)
+        if document is not None:
+            return {"backend": "blob", "bin_id": cached, "document": document, "error": ""}
+
+    bin_id = kv_read_bin_id()
+    if bin_id:
+        document = blob_get(bin_id)
+        if document is not None:
+            st.session_state["cloud_bin_id"] = bin_id
+            return {"backend": "blob", "bin_id": bin_id, "document": document, "error": ""}
+
+    bin_id = blob_create()
+    if bin_id:
+        kv_write_bin_id(bin_id)
+        st.session_state["cloud_bin_id"] = bin_id
+        document = blob_get(bin_id) or dict(EMPTY_CLOUD)
+        return {"backend": "blob", "bin_id": bin_id, "document": document, "error": ""}
+
+    text = rentry_fetch_text()
+    if text is None:
+        if rentry_save_text(json.dumps(EMPTY_CLOUD)):
+            text = rentry_fetch_text() or json.dumps(EMPTY_CLOUD)
+        else:
+            return {"backend": "", "bin_id": "", "document": dict(EMPTY_CLOUD), "error": "Cloud bin could not be created"}
+    try:
+        document = json.loads(text) if text.strip() else dict(EMPTY_CLOUD)
+    except json.JSONDecodeError:
+        document = dict(EMPTY_CLOUD)
+    st.session_state["cloud_backend"] = "rentry"
+    return {"backend": "rentry", "bin_id": RENTRY_URL, "document": document, "error": ""}
+
+
+def save_cloud_document(document: dict) -> str:
+    bin_id = clean_text(st.session_state.get("cloud_bin_id"))
+    if bin_id and blob_put(bin_id, document):
+        rentry_save_text(json.dumps(document, ensure_ascii=False))
+        return ""
+    storage = ensure_cloud_storage()
+    if storage["error"]:
+        return storage["error"]
+    if storage["backend"] == "blob" and blob_put(storage["bin_id"], document):
+        st.session_state["cloud_bin_id"] = storage["bin_id"]
+        rentry_save_text(json.dumps(document, ensure_ascii=False))
+        return ""
+    if rentry_save_text(json.dumps(document, ensure_ascii=False)):
+        return ""
+    return "Cloud PUT failed"
+
+
+def fetch_cloud_leads() -> tuple[list[dict], str]:
+    storage = ensure_cloud_storage()
+    if storage["error"]:
+        return [], storage["error"]
+    return parse_cloud_document(storage["document"]), ""
 
 
 def normalize_hours(raw: object) -> str:
@@ -181,7 +414,7 @@ def fold_fi(text: str) -> str:
 
 
 def address_key(address: str) -> str:
-    return fold_fi(normalize_addr(address))
+    return fold_fi(str(address).lower().strip())
 
 
 def first_street_number(address: str) -> int | None:
@@ -303,24 +536,6 @@ def load_samples_csv() -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def http_json(method: str, url: str, payload: dict | None = None) -> dict | list | None:
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=body, method=method)
-    request.add_header("Accept", "application/json")
-    request.add_header("User-Agent", "HelsinkiLeads/1.0")
-    if body is not None:
-        request.add_header("Content-Type", "application/json")
-    context = ssl.create_default_context()
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
-        raw = response.read()
-    if not raw:
-        return None
-    parsed = json.loads(raw.decode("utf-8"))
-    if isinstance(parsed, (dict, list)):
-        return parsed
-    return None
-
-
 def empty_lead(
     name: str,
     address: str,
@@ -330,60 +545,18 @@ def empty_lead(
     notes: str = "",
     src: str = "cloud",
 ) -> dict:
+    address_text = clean_text(address)
     return {
         "name": clean_text(name),
-        "address": clean_text(address),
+        "address": address_text,
         "website": normalize_website(website),
         "hours": normalize_hours(hours),
         "status": normalize_status(status),
         "notes": clean_text(notes),
-        "district": infer_district(clean_text(address)),
+        "district": infer_district(address_text),
         "src": src,
-        "sid": f"a_{address_key(clean_text(address))[:24] or 'unknown'}",
+        "sid": f"a_{address_key(address_text)[:24] or 'unknown'}",
     }
-
-
-def parse_cloud_leads(payload: object) -> list[dict]:
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data", payload)
-    rows = []
-    if isinstance(data, dict):
-        rows = data.get("leads") or []
-    elif isinstance(data, list):
-        rows = data
-    if not isinstance(rows, list):
-        return []
-    leads: list[dict] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = clean_text(row.get("name"))
-        address = clean_text(row.get("address"))
-        if not name or not address:
-            continue
-        leads.append(
-            empty_lead(
-                name=name,
-                address=address,
-                website=row.get("website", ""),
-                hours=row.get("hours", ""),
-                status=row.get("status", ""),
-                notes=row.get("notes", ""),
-                src="cloud",
-            )
-        )
-    return leads
-
-
-def fetch_cloud_leads() -> tuple[list[dict], str]:
-    try:
-        payload = http_json("GET", CLOUD_URL)
-        return parse_cloud_leads(payload), ""
-    except urllib.error.HTTPError as exc:
-        return [], f"Cloud GET HTTP {exc.code}"
-    except Exception as exc:
-        return [], f"Cloud GET failed: {exc}"
 
 
 def serialize_lead(lead: dict) -> dict:
@@ -394,18 +567,17 @@ def serialize_lead(lead: dict) -> dict:
         "hours": normalize_hours(lead.get("hours")),
         "status": normalize_status(lead.get("status", "")),
         "notes": clean_text(lead.get("notes")),
+        "district": infer_district(clean_text(lead.get("address"))),
     }
 
 
 def put_cloud_leads(leads: list[dict]) -> str:
-    packed = [serialize_lead(lead) for lead in leads if clean_text(lead.get("name")) and clean_text(lead.get("address"))]
-    try:
-        http_json("PUT", CLOUD_URL, {"name": CLOUD_NAME, "data": {"leads": packed}})
-        return ""
-    except urllib.error.HTTPError as exc:
-        return f"Cloud PUT HTTP {exc.code}"
-    except Exception as exc:
-        return f"Cloud PUT failed: {exc}"
+    packed = [
+        serialize_lead(lead)
+        for lead in leads
+        if clean_text(lead.get("name")) and clean_text(lead.get("address"))
+    ]
+    return save_cloud_document({"app": REPO_NAME, "leads": packed})
 
 
 def upsert_cloud_lead(lead: dict) -> str:
@@ -487,9 +659,9 @@ st.markdown(
 
 st.title("🎯 Helsinki Website Leads")
 st.markdown(
-    "Prepared leads come from `samples.csv`. Manual adds and edits sync through a "
-    "shared cloud JSON store, so every phone and new tab that opens the **base bookmark** "
-    "sees the same pipeline. Same street address = cloud record overwrites the CSV row."
+    "Prepared leads come from `samples.csv`. Manual adds and edits sync automatically "
+    f"through the shared **{REPO_NAME}** cloud bin — no database account, no URL copying. "
+    "Same street address = cloud record overwrites the CSV row on every device."
 )
 
 csv_df = load_samples_csv()
@@ -500,7 +672,7 @@ all_leads = merge_equal_weight(csv_leads, cloud_leads)
 if cloud_error:
     st.warning(f"Cloud sync unavailable right now ({cloud_error}). Showing samples.csv only.")
 else:
-    st.caption(f"Cloud sync OK · {len(cloud_leads)} manual/edited lead(s) from the shared database.")
+    st.caption(f"Cloud sync OK · {len(cloud_leads)} manual/edited lead(s) in the {REPO_NAME} database.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -702,10 +874,10 @@ for lead in enriched_rows:
 st.markdown("---")
 with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
     st.caption(
-        "Nur Name und Adresse sind Pflicht. Speichern schreibt den Lead in die Cloud — "
-        "sichtbar auf jedem Gerät mit dem normalen Lesezeichen, ohne URL-Parameter."
+        "Nur Name und Adresse sind Pflicht. Speichern schreibt den Lead in die "
+        f"{REPO_NAME}-Cloud — sichtbar auf jedem Gerät mit dem normalen Lesezeichen."
     )
-    with st.form("unzerstörbar_manual_form", clear_on_submit=True):
+    with st.form("automated_cloud_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma", key="form_add_name")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)", key="form_add_addr")
         add_link = st.text_input("Website / Demo-Link", value="https://", key="form_add_link")
@@ -724,14 +896,14 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
         if not add_name or not add_addr:
             st.warning("Bitte Name des Geschäfts und Adresse ausfüllen.")
         else:
-            save_err = upsert_cloud_lead(
-                empty_lead(
-                    name=add_name,
-                    address=add_addr,
-                    website=add_link,
-                    hours=add_hours,
-                )
+            new_lead = empty_lead(
+                name=add_name,
+                address=add_addr,
+                website=add_link,
+                hours=add_hours,
             )
+            new_lead["district"] = infer_district(add_addr)
+            save_err = upsert_cloud_lead(new_lead)
             if save_err:
                 st.error(save_err)
             else:
