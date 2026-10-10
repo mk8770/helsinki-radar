@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import math
 import re
@@ -12,11 +11,12 @@ import urllib.request
 
 import streamlit as st
 
-ENDPOINT_URL = "https://immanuel.co"
-GET_URL = "https://immanuel.co"
-KV_API = "https://keyvalue.immanuel.co"
-KV_APP_KEY = "hkradar1"
-KV_CHUNK = 800
+API_URL = "https://sheety.co"
+SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
+SHEET1_GET_URL = f"https://opensheet.elk.sh/{SHEET_ID}/sheet1"
+GVIZ_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:json&gid=0"
+)
 HTTP_TIMEOUT = 12
 
 HELSINKI_CENTRAL = (60.1708, 24.9414)
@@ -144,6 +144,14 @@ def is_blank_null(value: object) -> bool:
     return False
 
 
+def row_get(row: dict, *names: str) -> str:
+    folded = {str(key).strip().lower(): row.get(key) for key in row.keys()}
+    for name in names:
+        if name.lower() in folded:
+            return clean_text(folded[name.lower()])
+    return ""
+
+
 def normalize_hours(raw: object) -> str:
     text = clean_text(raw)
     return text if text else HOURS_FALLBACK
@@ -262,25 +270,22 @@ def native_geo_url(lat: float, lon: float) -> str:
     return f"https://www.google.com/maps/search/?api=1&query={lat:.6f},{lon:.6f}"
 
 
-def pack_lead(raw: dict) -> dict | None:
-    name = clean_text(raw.get("name"))
-    address = clean_text(raw.get("address"))
+def pack_lead(row: dict) -> dict | None:
+    name = row_get(row, "name", "company-name", "company")
+    address = row_get(row, "adress", "address", "street-address")
     if not name or not address:
         return None
-    saved_at = 0
-    try:
-        saved_at = int(raw.get("saved_at") or 0)
-    except Exception:
-        saved_at = 0
+    address = re.sub(r",?\s*helsinki\s*$", "", address, flags=re.I).strip() or address
     return {
+        "id": row_get(row, "id"),
         "name": name,
+        "adress": address,
         "address": address,
-        "website": normalize_website(raw.get("website")),
-        "hours": normalize_hours(raw.get("hours")),
-        "status": normalize_status(raw.get("status")),
-        "notes": clean_text(raw.get("notes")),
+        "website": normalize_website(row_get(row, "website", "sample-link", "url")),
+        "hours": normalize_hours(row_get(row, "hours", "visiting-hours")),
+        "status": normalize_status(row_get(row, "status", "visit status", "visitstatus")),
+        "notes": row_get(row, "notes", "field notes", "fieldnotes"),
         "district": infer_district(address),
-        "saved_at": saved_at,
         "sid": f"a_{address_key(address)[:24] or 'unknown'}",
     }
 
@@ -288,20 +293,19 @@ def pack_lead(raw: dict) -> dict | None:
 def as_leads_list(value: object) -> list[dict]:
     if value is None or is_blank_null(value):
         return []
+    rows: list = []
     if isinstance(value, list):
-        leads: list[dict] = []
-        for item in value:
-            if isinstance(item, dict):
-                packed = pack_lead(item)
-                if packed:
-                    leads.append(packed)
-        return leads
-    if isinstance(value, (bytes, bytearray)):
-        try:
-            value = value.decode("utf-8", "ignore")
-        except Exception:
-            return []
-    if isinstance(value, str):
+        rows = value
+    elif isinstance(value, dict):
+        if isinstance(value.get("sheet1"), list):
+            rows = value.get("sheet1") or []
+        elif isinstance(value.get("Sheet1"), list):
+            rows = value.get("Sheet1") or []
+        elif isinstance(value.get("leads"), list):
+            rows = value.get("leads") or []
+        elif pack_lead(value):
+            rows = [value]
+    elif isinstance(value, str):
         text = value.strip()
         if is_blank_null(text):
             return []
@@ -309,144 +313,126 @@ def as_leads_list(value: object) -> list[dict]:
             return as_leads_list(json.loads(text))
         except Exception:
             return []
-    if isinstance(value, dict):
-        if "leads" in value:
-            return as_leads_list(value.get("leads"))
-        if "data" in value:
-            return as_leads_list(value.get("data"))
-        packed = pack_lead(value)
-        return [packed] if packed else []
-    return []
-
-
-def http_call(method: str, url: str) -> object:
-    last_error: object = None
-    for attempt in range(3):
-        fetch_url = url
-        if method == "GET":
-            stamp = urllib.parse.quote(f"{time.time()}-{attempt}", safe="")
-            fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
-        request = urllib.request.Request(fetch_url, data=None, method=method)
-        request.add_header("Accept", "application/json, text/plain, */*")
-        request.add_header("User-Agent", "HelsinkiRadar/1.0")
-        request.add_header("Cache-Control", "no-cache, no-store, must-revalidate")
-        context = ssl.create_default_context()
-        try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-            time.sleep(0.2 * (attempt + 1))
+    leads: list[dict] = []
+    merged: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.2 * (attempt + 1))
-            continue
-        if not raw:
-            return ""
-        text = raw.decode("utf-8", "ignore").strip()
-        if is_blank_null(text):
-            return []
-        try:
-            parsed = json.loads(text)
-        except Exception:
-            return text
-        return [] if parsed is None else parsed
-    return last_error
+        packed = pack_lead(row)
+        if packed:
+            merged[address_key(packed["address"])] = packed
+    leads.extend(merged.values())
+    return leads
 
 
-def kv_get(item: str) -> str:
-    result = http_call("GET", f"{KV_API}/api/KeyVal/GetValue/{KV_APP_KEY}/{item}")
-    if isinstance(result, str):
-        return result.strip().strip('"')
-    if isinstance(result, (int, float)):
-        return str(result)
-    return ""
-
-
-def kv_put(item: str, value: str) -> bool:
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(value))
-    if not safe:
-        safe = "W10"
-    result = http_call("POST", f"{KV_API}/api/KeyVal/UpdateValue/{KV_APP_KEY}/{item}/{safe}")
-    return result is True or str(result).lower() == "true"
-
-
-def encode_payload(leads: list) -> list[str]:
-    blob = json.dumps(leads, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    token = base64.urlsafe_b64encode(blob).decode("ascii").rstrip("=") or "W10"
-    return [token[i : i + KV_CHUNK] for i in range(0, len(token), KV_CHUNK)] or ["W10"]
-
-
-def decode_payload(pieces: list[str]) -> list[dict]:
-    token = re.sub(r"[^A-Za-z0-9_-]", "", "".join(pieces))
-    if not token:
-        return []
-    padding = "=" * ((4 - len(token) % 4) % 4)
+def http_call(method: str, url: str, payload: dict | None = None) -> object:
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    fetch_url = url
+    if method == "GET":
+        stamp = urllib.parse.quote(str(time.time()), safe="")
+        fetch_url = f"{url}{'&' if '?' in url else '?'}nocache={stamp}"
+    request = urllib.request.Request(fetch_url, data=body, method=method)
+    request.add_header("Accept", "application/json, text/plain, */*")
+    request.add_header("User-Agent", "HelsinkiRadar/1.0")
+    request.add_header("Cache-Control", "no-cache, no-store, must-revalidate")
+    if body is not None:
+        request.add_header("Content-Type", "application/json; charset=utf-8")
+    context = ssl.create_default_context()
     try:
-        parsed = json.loads(base64.urlsafe_b64decode(token + padding).decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT, context=context) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read()
+        except Exception:
+            return None
+        if not raw:
+            return None
     except Exception:
+        return None
+    if not raw:
         return []
-    return as_leads_list(parsed)
+    text = raw.decode("utf-8", "ignore").strip()
+    if is_blank_null(text):
+        return []
+    if text.startswith("/*"):
+        start = text.find("(")
+        end = text.rfind(")")
+        if start >= 0 and end > start:
+            text = text[start + 1 : end]
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None if "<html" in text.lower() else text
+    return [] if parsed is None else parsed
 
 
-def initialize_empty_cloud() -> list:
-    kv_put("n", "1")
-    kv_put("c0", "W10")
-    return []
+def parse_gviz(document: object) -> list[dict]:
+    if not isinstance(document, dict):
+        return []
+    table = document.get("table") or {}
+    cols = table.get("cols") or []
+    labels = [clean_text(col.get("label") or col.get("id")) for col in cols]
+    rows: list[dict] = []
+    for row in table.get("rows") or []:
+        cells = row.get("c") or []
+        item: dict = {}
+        for index, cell in enumerate(cells):
+            label = labels[index] if index < len(labels) else f"col{index}"
+            value = ""
+            if isinstance(cell, dict):
+                value = cell.get("v")
+            item[label] = value
+        packed = pack_lead(item)
+        if packed:
+            rows.append(packed)
+    return rows
 
 
 def load_cloud_leads() -> list[dict]:
-    n_raw = kv_get("n")
-    c0 = kv_get("c0")
-    if is_blank_null(n_raw) and is_blank_null(c0):
-        return initialize_empty_cloud()
-    try:
-        n_chunks = max(1, min(40, int(n_raw or "1")))
-    except ValueError:
-        n_chunks = 1
-    pieces = [c0 if i == 0 else kv_get(f"c{i}") for i in range(n_chunks)]
-    leads = decode_payload(pieces)
-    return leads if isinstance(leads, list) else []
+    leads: list[dict] = []
+    sheety = http_call("GET", API_URL)
+    leads = as_leads_list(sheety)
+    if leads:
+        return leads
+    sheet = http_call("GET", SHEET1_GET_URL)
+    leads = as_leads_list(sheet)
+    if leads:
+        return leads
+    gviz = http_call("GET", GVIZ_URL)
+    parsed = parse_gviz(gviz)
+    if parsed:
+        return parsed
+    return []
 
 
-def save_cloud_leads(leads: object) -> bool:
-    packed = [item for item in as_leads_list(leads)]
-    chunks = encode_payload(packed)
-    if not kv_put("n", str(len(chunks))):
-        return False
-    if not all(kv_put(f"c{index}", chunk) for index, chunk in enumerate(chunks)):
-        return False
-    stored = load_cloud_leads()
-    want = {address_key(item["address"]) for item in packed}
-    have = {address_key(item["address"]) for item in stored}
-    return want.issubset(have)
+def sheet1_payload(lead: dict) -> dict:
+    return {
+        "sheet1": {
+            "name": clean_text(lead.get("name")),
+            "adress": clean_text(lead.get("adress") or lead.get("address")),
+            "website": normalize_website(lead.get("website")),
+            "hours": normalize_hours(lead.get("hours")),
+            "district": infer_district(clean_text(lead.get("adress") or lead.get("address"))),
+            "status": normalize_status(lead.get("status")),
+            "notes": clean_text(lead.get("notes")),
+        }
+    }
 
 
-def upsert_cloud_lead(lead: dict) -> bool:
-    current = load_cloud_leads()
-    if not isinstance(current, list):
-        current = []
-    incoming = pack_lead(lead)
-    if incoming is None:
-        return False
-    incoming["saved_at"] = int(time.time())
-    key = address_key(incoming["address"])
-    updated: list[dict] = []
-    replaced = False
-    for item in current:
-        packed = pack_lead(item)
-        if packed is None:
-            continue
-        if address_key(packed["address"]) == key:
-            packed.update(incoming)
-            updated.append(packed)
-            replaced = True
-        else:
-            updated.append(packed)
-    if not replaced:
-        updated.append(incoming)
-    return save_cloud_leads(updated)
+def post_sheet_lead(lead: dict) -> bool:
+    payload = sheet1_payload(lead)
+    result = http_call("POST", API_URL, payload)
+    if isinstance(result, dict) and (result.get("sheet1") or result.get("success")):
+        return True
+    if pack_lead(result) if isinstance(result, dict) else None:
+        return True
+    row_id = clean_text(lead.get("id"))
+    if row_id:
+        put_result = http_call("PUT", f"{API_URL}/sheet1/{row_id}", payload)
+        if isinstance(put_result, dict):
+            return True
+    return False
 
 
 def maps_embed_src(address: str) -> str:
@@ -478,7 +464,7 @@ st.markdown(
     header {visibility: hidden;}
     .stApp { background: #0f172a; }
     h1 { color: #f8fafc !important; letter-spacing: -0.03em; }
-    .addr-line, .district-line, .hours-line {
+    .addr-line, .hours-line {
         display: block;
         margin: 0 0 0.35rem 0;
         line-height: 1.4;
@@ -517,13 +503,13 @@ st.markdown(
 )
 
 st.title("🎯 Helsinki Website Leads")
-st.write("### 🌐 Synchronisiertes Cloud-Vertriebs-Dashboard (Echtzeit-Abgleich zwischen PC und Tablet)")
+st.write("### 🌐 Synchronisierte Google-Sheets-Pipeline (Echtzeit-Abgleich zwischen PC und Tablet)")
 
 all_leads = load_cloud_leads()
 if not isinstance(all_leads, list):
     all_leads = []
 
-st.caption(f"Live-Daten von {ENDPOINT_URL} · {len(all_leads)} Lead(s) in der Cloud.")
+st.caption(f"Quelle: Google Sheet / Sheety · {len(all_leads)} Lead(s) geladen.")
 
 st.subheader("Distance")
 filter_left, filter_right = st.columns(2)
@@ -573,7 +559,7 @@ visible.sort(key=lambda item: (0 if item["status"] == STATUSES[0] else 1, item["
 
 st.markdown("---")
 st.subheader("Active Lead Pipeline")
-st.caption(f"{len(visible)} sichtbar · {len(all_leads)} in der Cloud.")
+st.caption(f"{len(visible)} sichtbar · {len(all_leads)} in Google Sheets.")
 
 if not visible:
     st.info("Keine Leads sichtbar. Home Mode aktivieren oder unten einen Lead speichern.")
@@ -630,22 +616,22 @@ for lead in visible:
 
         chosen_status = st.selectbox("Visit Status", options=STATUSES, key=status_key)
         if chosen_status != lead["status"]:
-            if upsert_cloud_lead({**lead, "status": chosen_status, "notes": st.session_state[notes_key]}):
+            if post_sheet_lead({**lead, "status": chosen_status, "notes": st.session_state[notes_key]}):
                 st.rerun()
             else:
-                st.error("Status konnte nicht in der Cloud gespeichert werden.")
+                st.error("Status konnte nicht in Google Sheets gespeichert werden.")
 
         st.text_area("📝 Field Notes (e.g. Email, Mobile):", key=notes_key)
         if st.button("💾 Save Note", key=f"save_note_{uid}", use_container_width=True, type="primary"):
-            if upsert_cloud_lead({**lead, "status": st.session_state[status_key], "notes": st.session_state[notes_key]}):
+            if post_sheet_lead({**lead, "status": st.session_state[status_key], "notes": st.session_state[notes_key]}):
                 st.rerun()
             else:
-                st.error("Notiz konnte nicht in der Cloud gespeichert werden.")
+                st.error("Notiz konnte nicht in Google Sheets gespeichert werden.")
 
 st.markdown("---")
-with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
-    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in die Cloud — PC und Tablet sehen denselben Stand.")
-    with st.form("unzerstörbare_cloud_only_form", clear_on_submit=True):
+with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
+    st.caption("Nur Name und Adresse sind Pflicht. Speichern schreibt in Google Sheets — PC und Tablet laden dieselbe Tabelle.")
+    with st.form("google_sheets_sync_form", clear_on_submit=True):
         add_name = st.text_input("Name des Geschäfts / Firma")
         add_addr = st.text_input("Adresse (z.B. Hämeentie 38)")
         add_link = st.text_input("Website / Demo-Link")
@@ -666,6 +652,7 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
         else:
             new_lead = {
                 "name": add_name,
+                "adress": add_addr,
                 "address": add_addr,
                 "website": add_link,
                 "hours": add_hours,
@@ -673,8 +660,20 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=False):
                 "status": STATUSES[0],
                 "notes": "",
             }
-            if upsert_cloud_lead(new_lead):
+            payload = {
+                "sheet1": {
+                    "name": add_name,
+                    "adress": add_addr,
+                    "website": add_link,
+                    "hours": add_hours,
+                }
+            }
+            posted = http_call("POST", API_URL, payload)
+            ok = isinstance(posted, dict) and bool(posted.get("sheet1") or pack_lead(posted) or posted.get("success"))
+            if not ok:
+                ok = post_sheet_lead(new_lead)
+            if ok:
                 st.session_state["home_mode"] = True
                 st.rerun()
             else:
-                st.error("Cloud-Speichern fehlgeschlagen. Bitte erneut versuchen.")
+                st.error("Speichern in Google Sheets / Sheety ist fehlgeschlagen. Bitte erneut versuchen.")
