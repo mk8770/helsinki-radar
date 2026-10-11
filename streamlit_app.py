@@ -329,6 +329,7 @@ for idx, lead in enumerate(filtered_leads):
     current_edit_id = l_id if l_id not in (None, "") else f"local-{idx}"
     
     with st.container(border=True):
+        nav_url = maps_navigation_url(lead["address"], user_origin)
         col1, col2 = st.columns(2)
         with col1:
             if st.session_state["edit_lead_id"] == current_edit_id:
@@ -386,15 +387,10 @@ for idx, lead in enumerate(filtered_leads):
                 distance_m = lead.get("_distance_m")
                 distance_label = f"{distance_m} m" if distance_m is not None else "N/A"
                 safe_name = html.escape(str(lead["name"]))
-                nav_url = html.escape(maps_navigation_url(lead["address"], user_origin), quote=True)
                 st.markdown(
-                    f'<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:8px;">'
+                    f'<div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:8px;">'
                     f'<h2 style="margin:0;">{safe_name}</h2>'
                     f'<span style="color:#16a34a;font-size:2rem;font-weight:800;line-height:1;">{distance_label}</span>'
-                    f'<a href="{nav_url}" target="_blank" rel="noopener noreferrer" '
-                    f'style="display:inline-block;background:#1c83e1;color:#fff;text-decoration:none;'
-                    f'font-weight:700;padding:8px 16px;border-radius:10px;white-space:nowrap;">'
-                    f"🧭 Navigation</a>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -443,11 +439,17 @@ for idx, lead in enumerate(filtered_leads):
                         st.rerun()
         
         with col2:
-            # Absolut korrekter Google-Maps Link ohne Variablenfehler!
-            encoded_address = urllib.parse.quote(str(lead['address']) + ", Helsinki")
+            safe_nav = html.escape(nav_url, quote=True)
+            st.markdown(
+                f'<div style="text-align:left;margin:0 0 8px 0;">'
+                f'<a href="{safe_nav}" target="_blank" rel="noopener noreferrer" '
+                f'style="display:inline-block;background:#1c83e1;color:#fff;text-decoration:none;'
+                f'font-weight:700;padding:8px 16px;border-radius:10px;white-space:nowrap;">'
+                f"🧭 Navigation</a></div>",
+                unsafe_allow_html=True,
+            )
+            encoded_address = urllib.parse.quote(str(lead["address"]) + ", Helsinki")
             map_src = f"https://maps.google.com/maps?q={encoded_address}&output=embed"
-
-
             st.components.v1.iframe(map_src, height=160)
 
 st.divider()
