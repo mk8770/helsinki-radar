@@ -218,11 +218,12 @@ if not filtered_leads:
 # Layout-Karten zeichnen
 for idx, lead in enumerate(filtered_leads):
     l_id = lead.get("id")
+    current_edit_id = l_id if l_id not in (None, "") else f"local-{idx}"
     
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            if st.session_state["edit_lead_id"] == l_id and l_id is not None:
+            if st.session_state["edit_lead_id"] == current_edit_id:
                 st.markdown("### ✏️ Edit Entry")
                 edit_name = st.text_input("Name:", value=lead['name'], key=f"edit_name_{idx}")
                 edit_addr = st.text_input("Address:", value=lead['address'], key=f"edit_addr_{idx}")
@@ -232,10 +233,43 @@ for idx, lead in enumerate(filtered_leads):
                 edit_col1, edit_col2 = st.columns(2)
                 with edit_col1:
                     if st.button("💾 Save Changes", key=f"save_edit_{idx}", type="primary"):
-                        if update_lead_in_sheet(l_id, edit_name.strip(), edit_addr.strip(), edit_site.strip(), edit_hours.strip(), lead['notes']):
-                            st.session_state["edit_lead_id"] = None
-                            st.success("Successfully updated!")
-                            st.rerun()
+                        new_name = edit_name.strip()
+                        new_addr = edit_addr.strip()
+                        new_site = edit_site.strip() or "Website to be done"
+                        new_hours = edit_hours.strip() or "12:00 - 20:00"
+                        old_addr = str(lead.get("address") or "").lower().strip()
+                        updated_local = False
+                        new_local = []
+                        for row in st.session_state["local_leads"]:
+                            if str(row.get("address") or "").lower().strip() == old_addr:
+                                merged = dict(row)
+                                merged.update({
+                                    "id": l_id,
+                                    "name": new_name,
+                                    "address": new_addr,
+                                    "website": new_site,
+                                    "hours": new_hours,
+                                    "notes": lead.get("notes", ""),
+                                })
+                                new_local.append(merged)
+                                updated_local = True
+                            else:
+                                new_local.append(row)
+                        if not updated_local:
+                            new_local.append({
+                                "id": l_id,
+                                "name": new_name,
+                                "address": new_addr,
+                                "website": new_site,
+                                "hours": new_hours,
+                                "notes": lead.get("notes", ""),
+                            })
+                        st.session_state["local_leads"] = new_local
+                        if l_id:
+                            update_lead_in_sheet(l_id, new_name, new_addr, new_site, new_hours, lead.get("notes", ""))
+                        st.session_state["edit_lead_id"] = None
+                        st.success("Successfully updated!")
+                        st.rerun()
                 with edit_col2:
                     if st.button("Cancel", key=f"cancel_edit_{idx}"):
                         st.session_state["edit_lead_id"] = None
@@ -275,10 +309,9 @@ for idx, lead in enumerate(filtered_leads):
                                 st.success("Note saved!")
                                 st.rerun()
                 with btn_col2:
-                    if l_id:
-                        if st.button("✏️ Edit", key=f"edit_btn_{idx}", use_container_width=True):
-                            st.session_state["edit_lead_id"] = l_id
-                            st.rerun()
+                    if st.button("✏️ Edit", key=f"edit_btn_{idx}", use_container_width=True):
+                        st.session_state["edit_lead_id"] = current_edit_id
+                        st.rerun()
                 with btn_col3:
                     if st.button("❌ Delete", key=f"delete_{idx}", type="secondary", use_container_width=True):
                         st.session_state["local_leads"] = [x for x in st.session_state["local_leads"] if x["address"].lower().strip() != lead["address"].lower().strip()]
