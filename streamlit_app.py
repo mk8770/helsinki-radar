@@ -16,13 +16,85 @@ if "edit_lead_id" not in st.session_state:
     st.session_state["edit_lead_id"] = None
 
 # 1. Daten aus Google Sheets (Sheety) laden
+SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
+OPENSHEET_URL = "https://opensheet.elk.sh/" + SHEET_ID + "/sheet1"
+GVIZ_URL = "https://docs.google.com/spreadsheets/d/" + SHEET_ID + "/gviz/tq?tqx=out:json"
+
+
+def _row_value(row, *keys):
+    lowered = {}
+    for k, v in row.items():
+        lowered[str(k).strip().lower()] = v
+    for key in keys:
+        val = lowered.get(key.strip().lower())
+        if val not in (None, ""):
+            return val
+    return ""
+
+
+def _normalize_cloud_row(row):
+    return {
+        "id": row.get("id"),
+        "name": _row_value(row, "name"),
+        "address": _row_value(row, "address", "adress"),
+        "website": _row_value(row, "website", "website "),
+        "hours": _row_value(row, "hours"),
+        "notes": _row_value(row, "notes"),
+    }
+
+
+def _load_opensheet():
+    req = urllib.request.Request(OPENSHEET_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        rows = json.loads(response.read().decode("utf-8"))
+    if isinstance(rows, list):
+        return [_normalize_cloud_row(r) for r in rows if isinstance(r, dict)]
+    return []
+
+
+def _load_gviz():
+    req = urllib.request.Request(GVIZ_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        text = response.read().decode("utf-8")
+    start = text.find("{")
+    end = text.rfind("}")
+    data = json.loads(text[start:end + 1])
+    table = data.get("table", {})
+    cols = [str(c.get("label") or "").strip().lower() for c in table.get("cols", [])]
+    out = []
+    for row in table.get("rows", []):
+        item = {}
+        cells = row.get("c") or []
+        for idx, col in enumerate(cols):
+            cell = cells[idx] if idx < len(cells) else None
+            item[col or f"col{idx}"] = (cell or {}).get("v") if cell else ""
+        out.append(_normalize_cloud_row(item))
+    return out
+
+
+def _http_json_get(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
 def load_leads_from_sheet():
     try:
-        req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=7) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            if "sheet1" in data:
-                return data["sheet1"]
+        data = json.loads(_http_json_get(API_URL))
+        if "sheet1" in data and isinstance(data["sheet1"], list) and data["sheet1"]:
+            return [_normalize_cloud_row(r) for r in data["sheet1"] if isinstance(r, dict)]
+    except Exception:
+        pass
+    try:
+        rows = _load_gviz()
+        if rows:
+            return rows
+    except Exception:
+        pass
+    try:
+        rows = _load_opensheet()
+        if rows:
+            return rows
     except Exception:
         pass
     return []
@@ -46,7 +118,7 @@ def save_lead_to_sheet(name, address, website, hours):
             headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, 
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=7) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             return True
     except Exception:
         return False
@@ -70,7 +142,7 @@ def update_lead_in_sheet(lead_id, name, address, website, hours, notes):
             headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, 
             method="PUT"
         )
-        with urllib.request.urlopen(req, timeout=7) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             return True
     except Exception:
         return False
@@ -83,7 +155,7 @@ def delete_lead_from_sheet(lead_id):
             headers={"User-Agent": "Mozilla/5.0"},
             method="DELETE"
         )
-        with urllib.request.urlopen(req, timeout=7) as response:
+        with urllib.request.urlopen(req, timeout=15) as response:
             return True
     except Exception:
         return False
@@ -112,7 +184,7 @@ for l in st.session_state["local_leads"]:
 
 if cloud_leads:
     for l in cloud_leads:
-        addr = l.get("address", l.get("adress", "")).lower().strip()
+        addr = str(l.get("address") or l.get("adress") or "").lower().strip()
         if addr not in seen_addresses and l.get("name"):
             all_leads.append({
                 "id": l.get("id"),
