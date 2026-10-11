@@ -19,8 +19,8 @@ if "edit_lead_id" not in st.session_state:
     st.session_state["edit_lead_id"] = None
 if "geo_cache" not in st.session_state:
     st.session_state["geo_cache"] = {}
-
-HELSINKI_CENTRAL = (60.171319, 24.941457)
+if "user_origin" not in st.session_state:
+    st.session_state["user_origin"] = None
 
 # 1. Daten aus Google Sheets (Sheety) laden
 SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
@@ -220,18 +220,49 @@ def geocode_address(address):
     return None
 
 
-def distance_to_lead_m(address):
+def get_user_origin():
+    if st.session_state.get("user_origin"):
+        return st.session_state["user_origin"]
+    try:
+        from streamlit_js_eval import get_geolocation
+    except Exception:
+        return None
+    loc = get_geolocation()
+    if not isinstance(loc, dict):
+        return None
+    coords = loc.get("coords") or loc
+    try:
+        lat = float(coords.get("latitude"))
+        lon = float(coords.get("longitude"))
+    except Exception:
+        return None
+    origin = (lat, lon)
+    st.session_state["user_origin"] = origin
+    return origin
+
+
+def distance_to_lead_m(address, origin):
+    if not origin:
+        return None
     coords = geocode_address(address)
     if not coords:
         return None
-    return int(round(haversine_m(HELSINKI_CENTRAL, coords)))
+    return int(round(haversine_m(origin, coords)))
 
 
-def maps_navigation_url(address):
+def maps_navigation_url(address, origin=None):
     query = str(address or "").strip()
     if "helsinki" not in query.lower():
         query = query + ", Helsinki"
-    return "https://www.google.com/maps/dir/?api=1&destination=" + urllib.parse.quote(query)
+    dest = urllib.parse.quote(query)
+    if origin:
+        return (
+            "https://www.google.com/maps/dir/?api=1"
+            f"&origin={origin[0]},{origin[1]}"
+            f"&destination={dest}"
+            "&travelmode=walking"
+        )
+    return "https://www.google.com/maps/dir/?api=1&destination=" + dest + "&travelmode=walking"
 
 
 # DATENQUELLEN ZUSAMMENFÜHREN
@@ -263,13 +294,25 @@ distance_filter = st.slider("Max walking distance from YOUR location (meters)", 
 home_mode = st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_widget")
 selected_district_filter = st.selectbox("🌍 Filter by District", ["All Districts", "Kallio", "Töölö", "Kalasatama", "Central District"])
 
+user_origin = get_user_origin()
+if user_origin:
+    loc_col, refresh_col = st.columns([4, 1])
+    with loc_col:
+        st.caption("Distances are measured from your current GPS position.")
+    with refresh_col:
+        if st.button("📍 Refresh GPS", key="refresh_gps"):
+            st.session_state["user_origin"] = None
+            st.rerun()
+else:
+    st.info("Allow location access in the browser to see walking distance from where you are standing.")
+
 # Filter auf die Gesamtliste anwenden
 filtered_leads = []
 for lead in all_leads:
     district = parse_district(lead["address"])
     if selected_district_filter != "All Districts" and district != selected_district_filter:
         continue
-    lead_distance = distance_to_lead_m(lead["address"])
+    lead_distance = distance_to_lead_m(lead["address"], user_origin)
     lead["_distance_m"] = lead_distance
     if not home_mode and lead_distance is not None and lead_distance > float(distance_filter):
         continue
@@ -352,7 +395,7 @@ for idx, lead in enumerate(filtered_leads):
                 )
                 st.link_button(
                     "🧭 Navigation",
-                    maps_navigation_url(lead["address"]),
+                    maps_navigation_url(lead["address"], user_origin),
                     type="primary",
                 )
                 st.write(f"📍 **Address:** {lead['address']} ({parse_district(lead['address'])})")
