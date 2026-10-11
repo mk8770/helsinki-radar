@@ -1,8 +1,11 @@
-import streamlit as st
+import html
 import json
-import urllib.request
-import urllib.parse
+import math
 import urllib.error
+import urllib.parse
+import urllib.request
+
+import streamlit as st
 
 # Ihre VOLLSTÄNDIGE, permanente Sheety-Verbindung direkt zu Ihrem Google Sheet
 API_URL = "https://api.sheety.co/af5130fd4340e5b69490c1da248a8d72/websiteLeads/sheet1"
@@ -14,6 +17,10 @@ if "local_leads" not in st.session_state:
     st.session_state["local_leads"] = []
 if "edit_lead_id" not in st.session_state:
     st.session_state["edit_lead_id"] = None
+if "geo_cache" not in st.session_state:
+    st.session_state["geo_cache"] = {}
+
+HELSINKI_CENTRAL = (60.171319, 24.941457)
 
 # 1. Daten aus Google Sheets (Sheety) laden
 SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
@@ -173,6 +180,60 @@ def parse_district(address_str):
         return "Töölö"
     return "Central District"
 
+
+def haversine_m(origin, destination):
+    lat1, lon1 = origin
+    lat2, lon2 = destination
+    radius = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(min(1.0, a)))
+
+
+def geocode_address(address):
+    key = str(address or "").strip().lower()
+    if not key:
+        return None
+    cache = st.session_state["geo_cache"]
+    if key in cache:
+        return cache[key]
+    query = str(address).strip()
+    if "helsinki" not in query.lower():
+        query = query + ", Helsinki, Finland"
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json", "limit": "1", "countrycodes": "fi"}
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "HelsinkiLeads/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if data:
+            coords = (float(data[0]["lat"]), float(data[0]["lon"]))
+            cache[key] = coords
+            return coords
+    except Exception:
+        pass
+    cache[key] = None
+    return None
+
+
+def distance_to_lead_m(address):
+    coords = geocode_address(address)
+    if not coords:
+        return None
+    return int(round(haversine_m(HELSINKI_CENTRAL, coords)))
+
+
+def maps_navigation_url(address):
+    query = str(address or "").strip()
+    if "helsinki" not in query.lower():
+        query = query + ", Helsinki"
+    return "https://www.google.com/maps/dir/?api=1&destination=" + urllib.parse.quote(query)
+
+
 # DATENQUELLEN ZUSAMMENFÜHREN
 cloud_leads = load_leads_from_sheet()
 all_leads = []
@@ -207,6 +268,10 @@ filtered_leads = []
 for lead in all_leads:
     district = parse_district(lead["address"])
     if selected_district_filter != "All Districts" and district != selected_district_filter:
+        continue
+    lead_distance = distance_to_lead_m(lead["address"])
+    lead["_distance_m"] = lead_distance
+    if not home_mode and lead_distance is not None and lead_distance > float(distance_filter):
         continue
     filtered_leads.append(lead)
 
@@ -275,7 +340,21 @@ for idx, lead in enumerate(filtered_leads):
                         st.session_state["edit_lead_id"] = None
                         st.rerun()
             else:
-                st.markdown(f"## {lead['name']}")
+                distance_m = lead.get("_distance_m")
+                distance_label = f"{distance_m} m" if distance_m is not None else "N/A"
+                safe_name = html.escape(str(lead["name"]))
+                st.markdown(
+                    f'<div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">'
+                    f'<h2 style="margin:0;">{safe_name}</h2>'
+                    f'<span style="color:#16a34a;font-size:2rem;font-weight:800;line-height:1;">{distance_label}</span>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.link_button(
+                    "🧭 Navigation",
+                    maps_navigation_url(lead["address"]),
+                    type="primary",
+                )
                 st.write(f"📍 **Address:** {lead['address']} ({parse_district(lead['address'])})")
                 st.write(f"⏱️ **Visiting Hours:** {lead['hours']}")
                 

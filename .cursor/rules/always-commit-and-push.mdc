@@ -1,0 +1,13 @@
+---
+description: Always commit and push completed work without asking
+alwaysApply: true
+---
+
+# Always commit and push
+
+After finishing code changes in this repo, create a git commit and push to `origin` without asking first.
+
+- Include the files you changed (never secrets such as `.env`).
+- Use the repo's existing commit-message style (short lowercase `fix`/`add`/`update` why).
+- Push the current branch with a normal `git push` (no force push to main).
+- Do not wait for the user to say "commit" or "push".
