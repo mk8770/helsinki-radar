@@ -245,7 +245,7 @@ for idx, lead in enumerate(all_leads):
             st.text_input("Hours", key=hours_key)
             save_col, cancel_col = st.columns(2)
             with save_col:
-                if st.button("💾 Änderungen speichern", key=f"save_edit_{idx}", type="primary"):
+                if st.button("💾 Save Changes", key=f"save_edit_{idx}", type="primary"):
                     new_name = st.session_state.get(name_key, "").strip()
                     new_addr = st.session_state.get(addr_key, "").strip()
                     new_site = st.session_state.get(site_key, "").strip()
@@ -275,7 +275,7 @@ for idx, lead in enumerate(all_leads):
                         st.session_state["edit_lead_id"] = None
                         st.rerun()
             with cancel_col:
-                if st.button("Abbrechen", key=f"cancel_edit_{idx}", type="secondary"):
+                if st.button("Cancel", key=f"cancel_edit_{idx}", type="secondary"):
                     st.session_state["edit_lead_id"] = None
                     st.rerun()
         else:
