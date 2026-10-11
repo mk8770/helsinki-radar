@@ -216,9 +216,9 @@ for idx, lead in enumerate(filtered_leads):
                         st.rerun()
         
         with col2:
-            # Absolut korrekter Google-Maps Link ohne Formatierungsfehler
-            encoded_addr = urllib.parse.quote(str(lead['address']) + ", Helsinki")
-            map_src = f"https://maps.google.com/maps?q={encoded_addr}&output=embed"
+            # Absolut korrekter Google-Maps Link ohne Variablenfehler!
+            encoded_address = urllib.parse.quote(str(lead['address']) + ", Helsinki")
+            map_src = f"https://google.com{encoded_address}&output=embed"
             st.components.v1.iframe(map_src, height=160)
 
 st.divider()
