@@ -9,6 +9,9 @@ import streamlit as st
 
 # Ihre VOLLSTÄNDIGE, permanente Sheety-Verbindung direkt zu Ihrem Google Sheet
 API_URL = "https://api.sheety.co/af5130fd4340e5b69490c1da248a8d72/websiteLeads/sheet1"
+# Optional: Google Apps Script Web App URL (anyone-access) used when Sheety quota is exceeded.
+# Paste the /exec URL here or in Streamlit secrets as GAS_WEBAPP_URL.
+GAS_WEBAPP_URL = ""
 
 st.set_page_config(page_title="🎯 Helsinki Website Leads", layout="wide", initial_sidebar_state="collapsed")
 
@@ -106,29 +109,84 @@ def load_leads_from_sheet():
         pass
     return []
 
-# 2. Neuen Lead live in Google Sheets schreiben
-def save_lead_to_sheet(name, address, website, hours):
+def _secret_or_default(key, default=""):
     try:
-        payload = {
-            "sheet1": {
-                "name": name,
-                "address": address,
-                "website": website,
-                "hours": hours,
-                "notes": ""
-            }
-        }
-        json_data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            API_URL, 
-            data=json_data, 
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, 
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=15) as response:
-            return True
+        value = st.secrets[key]
+        if value:
+            return str(value).strip()
     except Exception:
+        pass
+    return default
+
+
+def _post_json(url, payload):
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.getcode(), response.read().decode("utf-8")
+    except urllib.error.HTTPError as err:
+        if err.code in (301, 302, 303, 307, 308):
+            location = err.headers.get("Location")
+            if location:
+                req2 = urllib.request.Request(location, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req2, timeout=15) as response:
+                    return response.getcode(), response.read().decode("utf-8")
+        detail = ""
+        try:
+            detail = err.read().decode("utf-8")
+        except Exception:
+            detail = str(err)
+        raise RuntimeError("HTTP {0}: {1}".format(err.code, detail))
+
+
+def _save_via_webhook(name, address, website, hours, notes=""):
+    webhook = _secret_or_default("GAS_WEBAPP_URL", GAS_WEBAPP_URL)
+    if not webhook:
         return False
+    payload = {
+        "name": name,
+        "address": address,
+        "adress": address,
+        "website": website,
+        "hours": hours,
+        "notes": notes or "",
+    }
+    status, _body = _post_json(webhook, payload)
+    return 200 <= int(status) < 400
+
+
+# 2. Neuen Lead live in Google Sheets schreiben
+def save_lead_to_sheet(name, address, website, hours, notes=""):
+    payload = {
+        "sheet1": {
+            "name": name,
+            "address": address,
+            "adress": address,
+            "website": website,
+            "hours": hours,
+            "notes": notes or "",
+        }
+    }
+    try:
+        status, _body = _post_json(API_URL, payload)
+        if 200 <= int(status) < 400:
+            return True, None
+    except Exception as exc:
+        sheety_error = str(exc)
+        try:
+            if _save_via_webhook(name, address, website, hours, notes):
+                return True, None
+        except Exception as webhook_exc:
+            return False, "{0} | webhook: {1}".format(sheety_error, webhook_exc)
+        return False, sheety_error
+    try:
+        if _save_via_webhook(name, address, website, hours, notes):
+            return True, None
+    except Exception as webhook_exc:
+        return False, str(webhook_exc)
+    return False, "Cloud write failed."
 
 # 3. Existierenden Lead (Adresse, Name, Website, Hours oder Notes) aktualisieren
 def update_lead_in_sheet(lead_id, name, address, website, hours, notes):
@@ -289,6 +347,28 @@ if cloud_leads:
 
 st.title("🎯 Helsinki Website Leads")
 st.write("### 🌐 Synchronisiertes Cloud-Dashboard (Echtzeit-Abgleich PC & Tablet via Google Sheets)")
+if st.session_state.pop("last_save_ok", None):
+    st.success("Saved to Google Sheets.")
+elif st.session_state.get("last_save_error"):
+    st.error(
+        "Cloud save failed (Sheety monthly quota). The lead is only on this screen until restart. "
+        + str(st.session_state.get("last_save_error"))
+    )
+    with st.expander("Restore cloud saving (Google Apps Script, 2 minutes)"):
+        st.markdown(
+            "Sheety is blocked until the quota resets or you upgrade. "
+            "To keep writing into the same Google Sheet: Extensions → Apps Script, paste this, deploy as Web app (Anyone), then put the `/exec` URL in Streamlit secrets as `GAS_WEBAPP_URL` or in `GAS_WEBAPP_URL` in the code."
+        )
+        st.code(
+            """function doPost(e) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+  const d = JSON.parse(e.postData.contents);
+  sheet.appendRow([d.name || "", d.address || d.adress || "", d.website || "", d.hours || "", d.notes || ""]);
+  return ContentService.createTextOutput(JSON.stringify({ok: true}))
+    .setMimeType(ContentService.MimeType.JSON);
+}""",
+            language="javascript",
+        )
 # Filter-Bereich oben
 distance_filter = st.slider("Max walking distance from YOUR location (meters)", min_value=100, max_value=6000, value=6000)
 home_mode = st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_widget")
@@ -480,6 +560,9 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                 }
                 
                 st.session_state["local_leads"].append(new_lead_dict)
-                save_lead_to_sheet(add_name.strip(), add_addr.strip(), final_link, final_hours)
-                st.success("Erfolgreich gespeichert!")
+                saved, save_error = save_lead_to_sheet(
+                    add_name.strip(), add_addr.strip(), final_link, final_hours
+                )
+                st.session_state["last_save_ok"] = bool(saved)
+                st.session_state["last_save_error"] = None if saved else save_error
                 st.rerun()
