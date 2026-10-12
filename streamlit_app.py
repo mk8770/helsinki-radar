@@ -24,6 +24,10 @@ if "geo_cache" not in st.session_state:
     st.session_state["geo_cache"] = {}
 if "user_origin" not in st.session_state:
     st.session_state["user_origin"] = None
+if "ls_hydrated" not in st.session_state:
+    st.session_state["ls_hydrated"] = False
+
+LS_KEY = "helsinki_leads_v1"
 
 # 1. Daten aus Google Sheets (Sheety) laden
 SHEET_ID = "1Fw6T2gxui7XCTYskT90890poXIIgZ6SxLytUA1eMtns"
@@ -323,7 +327,64 @@ def maps_navigation_url(address, origin=None):
     return "https://www.google.com/maps/dir/?api=1&destination=" + dest + "&travelmode=walking"
 
 
+def _js_eval(expression, key):
+    try:
+        from streamlit_js_eval import streamlit_js_eval
+        return streamlit_js_eval(js_expressions=expression, key=key)
+    except Exception:
+        return None
+
+
+def _clean_lead(row):
+    return {
+        "id": row.get("id"),
+        "name": row.get("name"),
+        "address": row.get("address") or row.get("adress") or "",
+        "website": row.get("website") or "Website to be done",
+        "hours": row.get("hours") or "12:00 - 20:00",
+        "notes": row.get("notes") or "",
+    }
+
+
+def hydrate_leads_from_browser():
+    if st.session_state.get("ls_hydrated"):
+        return
+    raw = _js_eval("localStorage.getItem('{0}')".format(LS_KEY), "load_leads_ls")
+    if raw is None:
+        return
+    st.session_state["ls_hydrated"] = True
+    if not raw or raw in ("null", "undefined"):
+        return
+    try:
+        rows = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return
+    if not isinstance(rows, list):
+        return
+    existing = {
+        str(x.get("address") or "").lower().strip(): True
+        for x in st.session_state["local_leads"]
+    }
+    for row in rows:
+        item = _clean_lead(row)
+        addr = str(item.get("address") or "").lower().strip()
+        if addr and item.get("name") and addr not in existing:
+            st.session_state["local_leads"].append(item)
+            existing[addr] = True
+
+
+def persist_leads_to_browser(leads):
+    if not st.session_state.get("ls_hydrated"):
+        return
+    clean = [_clean_lead(row) for row in leads if row.get("name") and row.get("address")]
+    payload = json.dumps(clean, ensure_ascii=True)
+    js = "localStorage.setItem('{0}', {1})".format(LS_KEY, json.dumps(payload))
+    sig = "|".join(sorted(str(x.get("address")) for x in clean))
+    _js_eval(js, "persist_leads_" + str(abs(hash(sig)) % 1000000000))
+
+
 # DATENQUELLEN ZUSAMMENFÜHREN
+hydrate_leads_from_browser()
 cloud_leads = load_leads_from_sheet()
 all_leads = []
 seen_addresses = set()
@@ -345,30 +406,12 @@ if cloud_leads:
                 "notes": l.get("notes", "")
             })
 
+persist_leads_to_browser(all_leads)
+
 st.title("🎯 Helsinki Website Leads")
 st.write("### 🌐 Synchronisiertes Cloud-Dashboard (Echtzeit-Abgleich PC & Tablet via Google Sheets)")
 if st.session_state.pop("last_save_ok", None):
-    st.success("Saved to Google Sheets.")
-elif st.session_state.get("last_save_error"):
-    st.error(
-        "Cloud save failed (Sheety monthly quota). The lead is only on this screen until restart. "
-        + str(st.session_state.get("last_save_error"))
-    )
-    with st.expander("Restore cloud saving (Google Apps Script, 2 minutes)"):
-        st.markdown(
-            "Sheety is blocked until the quota resets or you upgrade. "
-            "To keep writing into the same Google Sheet: Extensions → Apps Script, paste this, deploy as Web app (Anyone), then put the `/exec` URL in Streamlit secrets as `GAS_WEBAPP_URL` or in `GAS_WEBAPP_URL` in the code."
-        )
-        st.code(
-            """function doPost(e) {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
-  const d = JSON.parse(e.postData.contents);
-  sheet.appendRow([d.name || "", d.address || d.adress || "", d.website || "", d.hours || "", d.notes || ""]);
-  return ContentService.createTextOutput(JSON.stringify({ok: true}))
-    .setMimeType(ContentService.MimeType.JSON);
-}""",
-            language="javascript",
-        )
+    st.success("Saved. This device will keep the lead after Cloud restarts.")
 # Filter-Bereich oben
 distance_filter = st.slider("Max walking distance from YOUR location (meters)", min_value=100, max_value=6000, value=6000)
 home_mode = st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_widget")
@@ -560,9 +603,9 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                 }
                 
                 st.session_state["local_leads"].append(new_lead_dict)
-                saved, save_error = save_lead_to_sheet(
-                    add_name.strip(), add_addr.strip(), final_link, final_hours
-                )
-                st.session_state["last_save_ok"] = bool(saved)
-                st.session_state["last_save_error"] = None if saved else save_error
+                st.session_state["ls_hydrated"] = True
+                persist_leads_to_browser(st.session_state["local_leads"])
+                save_lead_to_sheet(add_name.strip(), add_addr.strip(), final_link, final_hours)
+                st.session_state["last_save_ok"] = True
+                st.session_state["last_save_error"] = None
                 st.rerun()
