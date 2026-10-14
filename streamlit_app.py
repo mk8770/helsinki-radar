@@ -27,6 +27,8 @@ if "user_origin" not in st.session_state:
     st.session_state["user_origin"] = None
 if "ls_hydrated" not in st.session_state:
     st.session_state["ls_hydrated"] = False
+if "deleted_addrs" not in st.session_state:
+    st.session_state["deleted_addrs"] = []
 
 LS_KEY = "helsinki_leads_v1"
 
@@ -124,20 +126,29 @@ def _secret_or_default(key, default=""):
     return default
 
 
+class _KeepPostRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if code in (301, 302, 303, 307, 308) and req.get_method() == "POST":
+            return urllib.request.Request(
+                newurl.replace(" ", "%20"),
+                data=req.data,
+                headers={"Content-Type": "text/plain;charset=utf-8", "User-Agent": "Mozilla/5.0"},
+                method="POST",
+            )
+        return urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl
+        )
+
+
 def _post_json(url, payload):
     body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    headers = {"Content-Type": "text/plain;charset=utf-8", "User-Agent": "Mozilla/5.0"}
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = urllib.request.build_opener(_KeepPostRedirectHandler)
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with opener.open(req, timeout=20) as response:
             return response.getcode(), response.read().decode("utf-8")
     except urllib.error.HTTPError as err:
-        if err.code in (301, 302, 303, 307, 308):
-            location = err.headers.get("Location")
-            if location:
-                req2 = urllib.request.Request(location, data=body, headers=headers, method="POST")
-                with urllib.request.urlopen(req2, timeout=15) as response:
-                    return response.getcode(), response.read().decode("utf-8")
         detail = ""
         try:
             detail = err.read().decode("utf-8")
@@ -169,8 +180,18 @@ def _webhook_write(action, name, address, website="", hours="", notes=""):
         "hours": hours,
         "notes": notes or "",
     }
-    status, _body = _post_json(webhook, payload)
-    return 200 <= int(status) < 400
+    status, raw = _post_json(webhook, payload)
+    if not (200 <= int(status) < 400):
+        return False
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except Exception:
+        parsed = {}
+    if parsed.get("service") == "helsinki-leads" and parsed.get("action") is None:
+        raise RuntimeError("Sheets webhook ignored the write (GET instead of POST).")
+    if parsed.get("ok") is False:
+        return False
+    return True
 
 
 # 2. Neuen Lead live in Google Sheets schreiben
@@ -428,13 +449,34 @@ cloud_leads = visible_cloud
 all_leads = []
 seen_addresses = set()
 
+deleted = {
+    str(a).lower().strip()
+    for a in (st.session_state.get("deleted_addrs") or [])
+    if str(a).strip()
+}
+if get_write_url():
+    still_deleted = []
+    for addr in deleted:
+        try:
+            delete_lead_from_sheet(None, addr)
+        except Exception:
+            still_deleted.append(addr)
+            continue
+        still_deleted.append(addr)
+    st.session_state["deleted_addrs"] = still_deleted
+
 for l in st.session_state["local_leads"]:
+    addr = str(l.get("address") or "").lower().strip()
+    if addr in deleted:
+        continue
     all_leads.append(l)
-    seen_addresses.add(l["address"].lower().strip())
+    seen_addresses.add(addr)
 
 if cloud_leads:
     for l in cloud_leads:
         addr = str(l.get("address") or l.get("adress") or "").lower().strip()
+        if addr in deleted:
+            continue
         if addr not in seen_addresses and l.get("name"):
             all_leads.append({
                 "id": l.get("id"),
@@ -623,20 +665,49 @@ for idx, lead in enumerate(filtered_leads):
                 with btn_col1:
                     if st.button("💾 Save Note", key=f"save_btn_{idx}", type="primary", use_container_width=True):
                         combined_text = f"[{selected_status}] {typed_notes}" if typed_notes else f"[{selected_status}]"
-                        if l_id:
-                            if update_lead_in_sheet(l_id, lead['name'], lead['address'], lead['website'], lead['hours'], combined_text):
-                                st.success("Note saved!")
-                                st.rerun()
+                        lead["notes"] = combined_text
+                        apply_local = False
+                        new_local = []
+                        addr_k = str(lead.get("address") or "").lower().strip()
+                        for row in st.session_state["local_leads"]:
+                            if str(row.get("address") or "").lower().strip() == addr_k:
+                                merged = dict(row)
+                                merged["notes"] = combined_text
+                                new_local.append(merged)
+                                apply_local = True
+                            else:
+                                new_local.append(row)
+                        if not apply_local:
+                            new_local.append(dict(lead))
+                        st.session_state["local_leads"] = new_local
+                        update_lead_in_sheet(
+                            l_id,
+                            lead["name"],
+                            lead["address"],
+                            lead["website"],
+                            lead["hours"],
+                            combined_text,
+                        )
+                        st.rerun()
                 with btn_col2:
                     if st.button("✏️ Edit", key=f"edit_btn_{idx}", use_container_width=True):
                         st.session_state["edit_lead_id"] = current_edit_id
                         st.rerun()
                 with btn_col3:
                     if st.button("❌ Delete", key=f"delete_{idx}", type="secondary", use_container_width=True):
-                        st.session_state["local_leads"] = [x for x in st.session_state["local_leads"] if x["address"].lower().strip() != lead["address"].lower().strip()]
-                        if l_id:
-                            delete_lead_from_sheet(l_id, lead.get("address", ""))
-                        st.success("Lead deleted!")
+                        addr_k = str(lead.get("address") or "").lower().strip()
+                        st.session_state["local_leads"] = [
+                            x
+                            for x in st.session_state["local_leads"]
+                            if str(x.get("address") or "").lower().strip() != addr_k
+                        ]
+                        deleted = list(st.session_state.get("deleted_addrs") or [])
+                        if addr_k and addr_k not in deleted:
+                            deleted.append(addr_k)
+                        st.session_state["deleted_addrs"] = deleted
+                        delete_lead_from_sheet(l_id, lead.get("address", ""))
+                        st.session_state["ls_hydrated"] = True
+                        persist_leads_to_browser(st.session_state["local_leads"])
                         st.rerun()
         
         with col2:
