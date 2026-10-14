@@ -4,6 +4,7 @@ import math
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import streamlit as st
 
@@ -145,11 +146,22 @@ def _post_json(url, payload):
         raise RuntimeError("HTTP {0}: {1}".format(err.code, detail))
 
 
-def _save_via_webhook(name, address, website, hours, notes=""):
-    webhook = _secret_or_default("GAS_WEBAPP_URL", GAS_WEBAPP_URL)
+SYNC_MARKER = "__helsinki_sync__"
+
+
+def get_write_url():
+    return (
+        _secret_or_default("GAS_WEBAPP_URL", GAS_WEBAPP_URL)
+        or str(st.session_state.get("gas_url") or "").strip()
+    )
+
+
+def _webhook_write(action, name, address, website="", hours="", notes=""):
+    webhook = get_write_url()
     if not webhook:
         return False
     payload = {
+        "action": action,
         "name": name,
         "address": address,
         "adress": address,
@@ -163,6 +175,13 @@ def _save_via_webhook(name, address, website, hours, notes=""):
 
 # 2. Neuen Lead live in Google Sheets schreiben
 def save_lead_to_sheet(name, address, website, hours, notes=""):
+    try:
+        if _webhook_write("upsert", name, address, website, hours, notes):
+            return True, None
+    except Exception as webhook_exc:
+        webhook_error = str(webhook_exc)
+    else:
+        webhook_error = "Sheets webhook is not connected."
     payload = {
         "sheet1": {
             "name": name,
@@ -178,22 +197,19 @@ def save_lead_to_sheet(name, address, website, hours, notes=""):
         if 200 <= int(status) < 400:
             return True, None
     except Exception as exc:
-        sheety_error = str(exc)
-        try:
-            if _save_via_webhook(name, address, website, hours, notes):
-                return True, None
-        except Exception as webhook_exc:
-            return False, "{0} | webhook: {1}".format(sheety_error, webhook_exc)
-        return False, sheety_error
-    try:
-        if _save_via_webhook(name, address, website, hours, notes):
-            return True, None
-    except Exception as webhook_exc:
-        return False, str(webhook_exc)
-    return False, "Cloud write failed."
+        return False, "{0} | {1}".format(webhook_error, exc)
+    return False, webhook_error
+
 
 # 3. Existierenden Lead (Adresse, Name, Website, Hours oder Notes) aktualisieren
 def update_lead_in_sheet(lead_id, name, address, website, hours, notes):
+    try:
+        if _webhook_write("upsert", name, address, website, hours, notes):
+            return True
+    except Exception:
+        pass
+    if lead_id in (None, ""):
+        return False
     try:
         payload = {
             "sheet1": {
@@ -201,28 +217,36 @@ def update_lead_in_sheet(lead_id, name, address, website, hours, notes):
                 "address": address,
                 "website": website,
                 "hours": hours,
-                "notes": notes
+                "notes": notes,
             }
         }
-        json_data = json.dumps(payload).encode('utf-8')
+        json_data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            f"{API_URL}/{lead_id}", 
-            data=json_data, 
-            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, 
-            method="PUT"
+            f"{API_URL}/{lead_id}",
+            data=json_data,
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            method="PUT",
         )
         with urllib.request.urlopen(req, timeout=15) as response:
             return True
     except Exception:
         return False
 
+
 # 4. Lead aus dem Google Sheet löschen
-def delete_lead_from_sheet(lead_id):
+def delete_lead_from_sheet(lead_id, address=""):
+    try:
+        if address and _webhook_write("delete", "", address):
+            return True
+    except Exception:
+        pass
+    if lead_id in (None, ""):
+        return False
     try:
         req = urllib.request.Request(
             f"{API_URL}/{lead_id}",
             headers={"User-Agent": "Mozilla/5.0"},
-            method="DELETE"
+            method="DELETE",
         )
         with urllib.request.urlopen(req, timeout=15) as response:
             return True
@@ -368,6 +392,8 @@ def hydrate_leads_from_browser():
     for row in rows:
         item = _clean_lead(row)
         addr = str(item.get("address") or "").lower().strip()
+        if item.get("name") == SYNC_MARKER:
+            continue
         if addr and item.get("name") and addr not in existing:
             st.session_state["local_leads"].append(item)
             existing[addr] = True
@@ -376,7 +402,11 @@ def hydrate_leads_from_browser():
 def persist_leads_to_browser(leads):
     if not st.session_state.get("ls_hydrated"):
         return
-    clean = [_clean_lead(row) for row in leads if row.get("name") and row.get("address")]
+    clean = [
+        _clean_lead(row)
+        for row in leads
+        if row.get("name") and row.get("address") and row.get("name") != SYNC_MARKER
+    ]
     payload = json.dumps(clean, ensure_ascii=True)
     js = "localStorage.setItem('{0}', {1})".format(LS_KEY, json.dumps(payload))
     sig = "|".join(sorted(str(x.get("address")) for x in clean))
@@ -386,6 +416,15 @@ def persist_leads_to_browser(leads):
 # DATENQUELLEN ZUSAMMENFÜHREN
 hydrate_leads_from_browser()
 cloud_leads = load_leads_from_sheet()
+visible_cloud = []
+for row in cloud_leads or []:
+    if str(row.get("name") or "").strip() == SYNC_MARKER:
+        marker_url = str(row.get("address") or row.get("website") or "").strip()
+        if marker_url.startswith("http"):
+            st.session_state["gas_url"] = marker_url
+        continue
+    visible_cloud.append(row)
+cloud_leads = visible_cloud
 all_leads = []
 seen_addresses = set()
 
@@ -411,7 +450,46 @@ persist_leads_to_browser(all_leads)
 st.title("🎯 Helsinki Website Leads")
 st.write("### 🌐 Synchronisiertes Cloud-Dashboard (Echtzeit-Abgleich PC & Tablet via Google Sheets)")
 if st.session_state.pop("last_save_ok", None):
-    st.success("Saved. This device will keep the lead after Cloud restarts.")
+    st.success("Saved to the shared Google Sheet.")
+
+if not get_write_url():
+    st.warning("Multi-device saving is off. Connect the Google Sheet webhook once so phones and PCs share the same leads.")
+    with st.expander("Connect Google Sheet for all devices (one-time)", expanded=True):
+        st.markdown(
+            "1. Open your Helsinki leads Google Sheet → **Extensions → Apps Script**.\n"
+            "2. Delete any placeholder code, paste the script below, click **Save**.\n"
+            "3. **Deploy → New deployment → Web app**. Execute as **Me**. Who has access: **Anyone**.\n"
+            "4. Paste the `/exec` URL here and click Connect."
+        )
+        try:
+            script_path = Path(__file__).resolve().parent.joinpath("apps_script", "Code.gs")
+            script_text = script_path.read_text(encoding="utf-8")
+        except Exception:
+            script_text = "See apps_script/Code.gs in the GitHub repo."
+        st.code(script_text, language="javascript")
+        pasted_url = st.text_input("Web app URL", placeholder="https://script.google.com/macros/s/.../exec")
+        if st.button("Connect Google Sheet", type="primary"):
+            url = (pasted_url or "").strip()
+            if not url.startswith("http"):
+                st.error("Paste the full /exec URL from Apps Script.")
+            else:
+                try:
+                    st.session_state["gas_url"] = url
+                    _webhook_write(
+                        "upsert",
+                        SYNC_MARKER,
+                        url,
+                        "",
+                        "",
+                        "sync",
+                    )
+                    st.success("Connected. Other devices will pick this up from the sheet.")
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state["gas_url"] = url
+                    st.error("URL saved on this session, but the test write failed: {0}".format(exc))
+elif get_write_url():
+    st.caption("Shared Google Sheet sync is on. New leads are visible on other devices after refresh.")
 # Filter-Bereich oben
 distance_filter = st.slider("Max walking distance from YOUR location (meters)", min_value=100, max_value=6000, value=6000)
 home_mode = st.checkbox("🏠 Home Mode (Show all prepared leads)", value=True, key="home_mode_widget")
@@ -557,7 +635,7 @@ for idx, lead in enumerate(filtered_leads):
                     if st.button("❌ Delete", key=f"delete_{idx}", type="secondary", use_container_width=True):
                         st.session_state["local_leads"] = [x for x in st.session_state["local_leads"] if x["address"].lower().strip() != lead["address"].lower().strip()]
                         if l_id:
-                            delete_lead_from_sheet(l_id)
+                            delete_lead_from_sheet(l_id, lead.get("address", ""))
                         st.success("Lead deleted!")
                         st.rerun()
         
