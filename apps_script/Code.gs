@@ -15,13 +15,46 @@ function norm_(value) {
     .trim();
 }
 
+function headerIndex_(headers, names) {
+  for (let i = 0; i < headers.length; i++) {
+    const h = String(headers[i] || "")
+      .trim()
+      .toLowerCase();
+    if (names.indexOf(h) !== -1) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function writeLeadRow_(sheet, rowIndex, d) {
+  const lastCol = Math.max(sheet.getLastColumn(), 5);
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const values = sheet.getRange(rowIndex, 1, 1, lastCol).getValues()[0];
+  function setCol(cands, val) {
+    const idx = headerIndex_(headers, cands);
+    if (idx >= 0) {
+      values[idx] = val;
+    }
+  }
+  setCol(["name"], d.name || "");
+  setCol(["address", "adress"], d.address || "");
+  setCol(["website"], d.website || "");
+  setCol(["hours"], d.hours || "");
+  setCol(["notes"], d.notes || "");
+  if (headerIndex_(headers, ["website"]) < 0) {
+    values[2] = d.website || "";
+  }
+  sheet.getRange(rowIndex, 1, 1, lastCol).setValues([values]);
+}
+
 function rowMatches_(row, needle) {
   if (!needle) {
     return false;
   }
   const addr = norm_(row[1]);
   const name = norm_(row[0]);
-  return addr === needle || name === needle || addr.indexOf(needle) !== -1 || needle.indexOf(addr) !== -1;
+  return addr === needle || name === needle || (addr && (addr.indexOf(needle) !== -1 || needle.indexOf(addr) !== -1));
 }
 
 function parseBody_(e) {
@@ -52,8 +85,9 @@ function doPost(e) {
   const website = d.website || "";
   const hours = d.hours || "";
   const notes = d.notes || "";
-  const needle = norm_(address) || norm_(name);
+  const needle = norm_(d.match || address) || norm_(name);
   const rows = sheet.getDataRange().getValues();
+  const payload = { name: name, address: address, website: website, hours: hours, notes: notes };
 
   if (action === "delete") {
     let removed = 0;
@@ -69,7 +103,7 @@ function doPost(e) {
   let found = 0;
   for (let i = 2; i <= rows.length; i++) {
     if (rowMatches_(rows[i - 1], needle)) {
-      sheet.getRange(i, 1, 1, 5).setValues([[name, address, website, hours, notes]]);
+      writeLeadRow_(sheet, i, payload);
       found = i;
       break;
     }
@@ -77,5 +111,5 @@ function doPost(e) {
   if (!found) {
     sheet.appendRow([name, address, website, hours, notes]);
   }
-  return json_({ ok: true, action: found ? "update" : "insert" });
+  return json_({ ok: true, action: found ? "update" : "insert", website: website });
 }

@@ -1,6 +1,7 @@
 import html
 import json
 import math
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +30,8 @@ if "ls_hydrated" not in st.session_state:
     st.session_state["ls_hydrated"] = False
 if "deleted_addrs" not in st.session_state:
     st.session_state["deleted_addrs"] = []
+if "pending_sync" not in st.session_state:
+    st.session_state["pending_sync"] = {}
 
 LS_KEY = "helsinki_leads_v1"
 
@@ -70,7 +73,8 @@ def _load_opensheet():
 
 
 def _load_gviz():
-    req = urllib.request.Request(GVIZ_URL, headers={"User-Agent": "Mozilla/5.0"})
+    gviz_url = GVIZ_URL + "&nocache=" + str(int(time.time()))
+    req = urllib.request.Request(gviz_url, headers={"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"})
     with urllib.request.urlopen(req, timeout=15) as response:
         text = response.read().decode("utf-8")
     start = text.find("{")
@@ -165,6 +169,28 @@ def get_write_url():
         _secret_or_default("GAS_WEBAPP_URL", GAS_WEBAPP_URL)
         or str(st.session_state.get("gas_url") or "").strip()
     )
+
+
+def _addr_key(row_or_addr):
+    if isinstance(row_or_addr, dict):
+        return str(row_or_addr.get("address") or row_or_addr.get("adress") or "").lower().strip()
+    return str(row_or_addr or "").lower().strip()
+
+
+def _remember_pending(lead):
+    addr = _addr_key(lead)
+    if not addr:
+        return
+    pending = dict(st.session_state.get("pending_sync") or {})
+    pending[addr] = {
+        "id": lead.get("id"),
+        "name": lead.get("name"),
+        "address": lead.get("address") or lead.get("adress") or "",
+        "website": lead.get("website") or "Website to be done",
+        "hours": lead.get("hours") or "12:00 - 20:00",
+        "notes": lead.get("notes") or "",
+    }
+    st.session_state["pending_sync"] = pending
 
 
 def _webhook_write(action, name, address, website="", hours="", notes=""):
@@ -465,34 +491,53 @@ if get_write_url():
         still_deleted.append(addr)
     st.session_state["deleted_addrs"] = still_deleted
 
+if cloud_leads:
+    for l in cloud_leads:
+        addr = _addr_key(l)
+        if addr in deleted:
+            continue
+        if addr in seen_addresses or not l.get("name"):
+            continue
+        all_leads.append({
+            "id": l.get("id"),
+            "name": l.get("name"),
+            "address": l.get("address", l.get("adress", "")),
+            "website": l.get("website") or "Website to be done",
+            "hours": l.get("hours") or "12:00 - 20:00",
+            "notes": l.get("notes") or "",
+        })
+        seen_addresses.add(addr)
+
+pending = dict(st.session_state.get("pending_sync") or {})
+cleared_pending = {}
+for addr, row in pending.items():
+    if not addr or addr in deleted:
+        continue
+    cloud_row = next((x for x in all_leads if _addr_key(x) == addr), None)
+    if cloud_row and str(cloud_row.get("website") or "") == str(row.get("website") or "") and str(cloud_row.get("name") or "") == str(row.get("name") or ""):
+        continue
+    all_leads = [x for x in all_leads if _addr_key(x) != addr]
+    all_leads.append(row)
+    seen_addresses.add(addr)
+    cleared_pending[addr] = row
+st.session_state["pending_sync"] = cleared_pending
+
 for l in st.session_state["local_leads"]:
-    addr = str(l.get("address") or "").lower().strip()
-    if addr in deleted:
+    addr = _addr_key(l)
+    if not addr or addr in deleted or addr in seen_addresses:
         continue
     all_leads.append(l)
     seen_addresses.add(addr)
-
-if cloud_leads:
-    for l in cloud_leads:
-        addr = str(l.get("address") or l.get("adress") or "").lower().strip()
-        if addr in deleted:
-            continue
-        if addr not in seen_addresses and l.get("name"):
-            all_leads.append({
-                "id": l.get("id"),
-                "name": l.get("name"),
-                "address": l.get("address", l.get("adress", "")),
-                "website": l.get("website", "Website to be done"),
-                "hours": l.get("hours", "12:00 - 20:00"),
-                "notes": l.get("notes", "")
-            })
 
 persist_leads_to_browser(all_leads)
 
 st.title("🎯 Helsinki Website Leads")
 st.write("### 🌐 Synchronisiertes Cloud-Dashboard (Echtzeit-Abgleich PC & Tablet via Google Sheets)")
 if st.session_state.pop("last_save_ok", None):
-    st.success("Saved to the shared Google Sheet.")
+    st.success("Saved to the shared Google Sheet. Refresh the phone to see the new demo link.")
+last_save_error = st.session_state.pop("last_save_error", None)
+if last_save_error:
+    st.error(last_save_error)
 
 if not get_write_url():
     st.warning("Multi-device saving is off. Connect the Google Sheet webhook once so phones and PCs share the same leads.")
@@ -617,10 +662,19 @@ for idx, lead in enumerate(filtered_leads):
                                 "notes": lead.get("notes", ""),
                             })
                         st.session_state["local_leads"] = new_local
-                        if l_id:
-                            update_lead_in_sheet(l_id, new_name, new_addr, new_site, new_hours, lead.get("notes", ""))
+                        updated_lead = {
+                            "id": l_id,
+                            "name": new_name,
+                            "address": new_addr,
+                            "website": new_site,
+                            "hours": new_hours,
+                            "notes": lead.get("notes", ""),
+                        }
+                        _remember_pending(updated_lead)
+                        wrote = update_lead_in_sheet(l_id, new_name, new_addr, new_site, new_hours, lead.get("notes", ""))
                         st.session_state["edit_lead_id"] = None
-                        st.success("Successfully updated!")
+                        st.session_state["last_save_ok"] = bool(wrote)
+                        st.session_state["last_save_error"] = None if wrote else "Saved on this device only. Other phones will keep the old demo link until Google Sheet sync is connected."
                         st.rerun()
                 with edit_col2:
                     if st.button("Cancel", key=f"cancel_edit_{idx}"):
@@ -680,6 +734,14 @@ for idx, lead in enumerate(filtered_leads):
                         if not apply_local:
                             new_local.append(dict(lead))
                         st.session_state["local_leads"] = new_local
+                        _remember_pending({
+                            "id": l_id,
+                            "name": lead["name"],
+                            "address": lead["address"],
+                            "website": lead["website"],
+                            "hours": lead["hours"],
+                            "notes": combined_text,
+                        })
                         update_lead_in_sheet(
                             l_id,
                             lead["name"],
@@ -753,6 +815,7 @@ with st.expander("➕ Neuen Lead manuell hinzufügen", expanded=True):
                 
                 st.session_state["local_leads"].append(new_lead_dict)
                 st.session_state["ls_hydrated"] = True
+                _remember_pending(new_lead_dict)
                 persist_leads_to_browser(st.session_state["local_leads"])
                 save_lead_to_sheet(add_name.strip(), add_addr.strip(), final_link, final_hours)
                 st.session_state["last_save_ok"] = True
